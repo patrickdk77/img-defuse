@@ -1,0 +1,475 @@
+import type { Run } from './context';
+import { StopError } from './errors';
+import { inspectExif } from './exif';
+import { IfdError, IfdReader } from './ifd';
+import { checkIcc, hasDoctype, photoshopResources } from './metadata';
+import { fileSlice, joinedSlice, latin1, View } from './slice';
+import { ImageCategory as C, ImageDetail as D } from './types';
+
+const XMP_ID = 'http://ns.adobe.com/xap/1.0/\0';
+const XMP_EXTENSION_ID = 'http://ns.adobe.com/xmp/extension/\0';
+
+/** Frame types read: baseline, extended, progressive and lossless, each with Huffman or arithmetic coding. */
+const SOF = new Map<number, { progressive: boolean; lossless: boolean; precisions: number[] }>([
+  [0xc0, { progressive: false, lossless: false, precisions: [8] }],
+  [0xc1, { progressive: false, lossless: false, precisions: [8, 12] }],
+  [0xc2, { progressive: true, lossless: false, precisions: [8, 12] }],
+  [0xc3, { progressive: false, lossless: true, precisions: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] }],
+  [0xc9, { progressive: false, lossless: false, precisions: [8, 12] }],
+  [0xca, { progressive: true, lossless: false, precisions: [8, 12] }],
+  [0xcb, { progressive: false, lossless: true, precisions: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16] }],
+]);
+const HIERARCHICAL = new Set([0xc5, 0xc6, 0xc7, 0xcd, 0xce, 0xcf, 0xde, 0xdf]);
+
+const NAMES = new Map([
+  [0xc4, 'DHT'],
+  [0xcc, 'DAC'],
+  [0xd8, 'SOI'],
+  [0xd9, 'EOI'],
+  [0xda, 'SOS'],
+  [0xdb, 'DQT'],
+  [0xdc, 'DNL'],
+  [0xdd, 'DRI'],
+  [0xfe, 'COM'],
+]);
+
+const markerName = (m: number): string => {
+  if (m >= 0xe0 && m <= 0xef) return `APP${m - 0xe0}`;
+  if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return `SOF${m - 0xc0}`;
+  return NAMES.get(m) ?? `marker 0xFF${m.toString(16).toUpperCase().padStart(2, '0')}`;
+};
+
+interface Frame {
+  progressive: boolean;
+  lossless: boolean;
+  precision: number;
+  components: Map<number, number>;
+}
+
+interface Segment {
+  marker: number;
+  start: number;
+  /** The payload, after the length field. */
+  data: number;
+  end: number;
+  loc: string;
+}
+
+/** A Buffer view of bytes, for indexOf. */
+const buf = (b: Uint8Array) => Buffer.from(b.buffer, b.byteOffset, b.byteLength);
+
+export async function inspectJpeg(run: Run): Promise<void> {
+  const r = run.reader;
+  const size = run.size;
+  let pos = 2;
+  let frame: Frame | undefined;
+  const qtables = new Set<number>();
+  let interval = 0;
+  let scans = 0;
+  let exifCount = 0;
+  const icc: Array<{ seq: number; count: number; start: number; length: number; segment: Segment }> = [];
+  const extended: Segment[] = [];
+  let mpf: Segment | undefined;
+
+  /**
+   * Finds the next marker from `p`: bytes before it other than fill are hidden data. Returns the marker, the offset of
+   * its first FF, and the offset of the marker code after any fill bytes.
+   */
+  const nextMarker = async (p: number): Promise<{ marker: number; at: number; code: number }> => {
+    let at = p;
+    for (;;) {
+      run.time();
+      if (at >= size) run.stop(D.Truncated, 'the JPEG ends before EOI', `offset ${p}`);
+      const window = await r.read(at, Math.min(65536, size - at));
+      const ff = buf(window).indexOf(0xff);
+      if (ff < 0) {
+        at += window.length;
+        continue;
+      }
+      let q = at + ff;
+      // Skip fill bytes.
+      let b = 0xff;
+      while (b === 0xff) {
+        q++;
+        if (q >= size) run.stop(D.Truncated, 'the JPEG ends before EOI', `offset ${p}`);
+        b = (await r.read(q, 1))[0];
+      }
+      if (b === 0x00) {
+        // FF 00 outside a scan is not a marker.
+        at = q + 1;
+        continue;
+      }
+      await run.gap(p, at + ff, 'hidden');
+      return { marker: b, at: at + ff, code: q };
+    }
+  };
+
+  /** Reads entropy-coded data from `p` to the first marker that is not a restart marker. Returns the offset of that marker's first FF. */
+  const scanData = async (p: number, loc: string): Promise<number> => {
+    let afterFf = false;
+    let ffStart = -1;
+    let restart = 0;
+    let base = p;
+    for await (const chunk of r.chunks(p, size - p)) {
+      run.time();
+      const b = buf(chunk);
+      let i = 0;
+      while (i < b.length) {
+        if (!afterFf) {
+          const j = b.indexOf(0xff, i);
+          if (j < 0) break;
+          ffStart = base + j;
+          afterFf = true;
+          i = j + 1;
+          continue;
+        }
+        const x = b[i];
+        if (x === 0xff) {
+          i++;
+          continue;
+        }
+        afterFf = false;
+        i++;
+        if (x === 0x00) continue;
+        if (x >= 0xd0 && x <= 0xd7) {
+          if (interval === 0) run.stop(D.BadData, 'a restart marker appears without a restart interval', loc);
+          if (x - 0xd0 !== restart % 8) run.stop(D.BadData, `restart marker ${x - 0xd0} appears where ${restart % 8} belongs`, loc);
+          restart++;
+          continue;
+        }
+        return ffStart;
+      }
+      base += chunk.length;
+    }
+    return run.stop(D.Truncated, 'the JPEG ends inside a scan', loc);
+  };
+
+  for (;;) {
+    const { marker, at, code } = await nextMarker(pos);
+    const name = markerName(marker);
+    const loc = `${name} segment at ${at}`;
+    run.block();
+    if (marker === 0xd9) {
+      if (!frame || scans === 0) run.stop(D.BadLayout, 'the JPEG ends before any image data', loc);
+      pos = code + 1;
+      break;
+    }
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) run.stop(D.BadLayout, `${name} outside image data`, loc);
+    if (HIERARCHICAL.has(marker)) throw unsupported('hierarchical JPEG', loc);
+    if (marker === 0xf7 || marker === 0xf8) throw unsupported('JPEG-LS', loc);
+    if (code + 3 > size) run.stop(D.Truncated, `${name} is cut short`, loc);
+    const length = new View(await r.read(code + 1, 2)).u16(0);
+    if (length < 2) run.stop(D.BadLayout, `${name} has the length ${length}`, loc);
+    const seg: Segment = { marker, start: at, data: code + 3, end: code + 1 + length, loc };
+    if (seg.end > size) run.stop(D.Truncated, `${name} runs past the end of the file`, loc);
+    const n = length - 2;
+    pos = seg.end;
+
+    if (SOF.has(marker)) {
+      if (frame) run.stop(D.BadLayout, 'the JPEG has a second frame header', loc);
+      const kind = SOF.get(marker) ?? { progressive: false, lossless: false, precisions: [8] };
+      const v = new View(await r.read(seg.data, n));
+      if (n < 6) run.stop(D.BadHeader, 'the frame header is cut short', loc);
+      const precision = v.u8(0);
+      const height = v.u16(1);
+      const width = v.u16(3);
+      const count = v.u8(5);
+      if (n !== 6 + 3 * count) run.stop(D.BadHeader, 'the frame header length does not match its components', loc);
+      if (!kind.precisions.includes(precision)) run.stop(D.BadHeader, `a ${name} frame has the precision ${precision}`, loc);
+      if (height === 0) run.stop(D.BadHeader, 'the frame height is 0, which needs a DNL marker', loc);
+      if (width === 0) run.stop(D.BadHeader, 'the frame width is 0', loc);
+      if (count < 1 || count > 4) run.stop(D.BadHeader, `the frame has ${count} components`, loc);
+      const components = new Map<number, number>();
+      for (let i = 0; i < count; i++) {
+        const id = v.u8(6 + i * 3);
+        const hv = v.u8(7 + i * 3);
+        const tq = v.u8(8 + i * 3);
+        if (components.has(id)) run.stop(D.BadHeader, `component ${id} appears twice`, loc);
+        if (hv >> 4 < 1 || hv >> 4 > 4 || (hv & 15) < 1 || (hv & 15) > 4) run.stop(D.BadHeader, `component ${id} has a sampling factor outside 1 to 4`, loc);
+        if (tq > 3) run.stop(D.BadHeader, `component ${id} names quantization table ${tq}`, loc);
+        components.set(id, tq);
+      }
+      frame = { progressive: kind.progressive, lossless: kind.lossless, precision, components };
+      run.image(width, height, width * height * count * (precision > 8 ? 2 : 1), loc);
+      continue;
+    }
+    switch (marker) {
+      case 0xdb: {
+        const v = new View(await r.read(seg.data, n));
+        let p = 0;
+        while (p < n) {
+          const pq = v.u8(p) >> 4;
+          const tq = v.u8(p) & 15;
+          if (pq > 1 || tq > 3) run.stop(D.BadHeader, `a quantization table has precision ${pq} and id ${tq}`, loc);
+          p += 1 + (pq ? 128 : 64);
+          if (p > n) run.stop(D.BadHeader, 'a quantization table runs past its segment', loc);
+          qtables.add(tq);
+        }
+        break;
+      }
+      case 0xc4: {
+        const v = new View(await r.read(seg.data, n));
+        let p = 0;
+        while (p < n) {
+          if (p + 17 > n) run.stop(D.BadHeader, 'a Huffman table runs past its segment', loc);
+          const tc = v.u8(p) >> 4;
+          const th = v.u8(p) & 15;
+          if (tc > 1 || th > 3) run.stop(D.BadHeader, `a Huffman table has class ${tc} and id ${th}`, loc);
+          let total = 0;
+          let nextCode = 0;
+          for (let l = 1; l <= 16; l++) {
+            const count = v.u8(p + l);
+            total += count;
+            nextCode += count;
+            // No code may be all ones, so the codes of each length must fit below 2^length.
+            if (nextCode >= 2 ** l && count > 0) run.stop(D.BadHeader, 'a Huffman table holds more codes than its code lengths allow', loc);
+            nextCode *= 2;
+          }
+          if (total > 256) run.stop(D.BadHeader, 'a Huffman table holds more than 256 symbols', loc);
+          p += 17 + total;
+          if (p > n) run.stop(D.BadHeader, 'a Huffman table runs past its segment', loc);
+        }
+        break;
+      }
+      case 0xdd: {
+        if (n !== 2) run.stop(D.BadHeader, 'DRI is not 4 bytes', loc);
+        interval = new View(await r.read(seg.data, 2)).u16(0);
+        break;
+      }
+      case 0xcc:
+        if (n % 2 !== 0) run.stop(D.BadHeader, 'DAC does not split into conditioning entries', loc);
+        break;
+      case 0xdc:
+        run.stop(D.BadLayout, 'DNL appears, but the frame gives its height', loc);
+        break;
+      case 0xda: {
+        if (!frame) run.stop(D.BadLayout, 'a scan comes before the frame header', loc);
+        const f = frame as Frame;
+        scans++;
+        if (scans > run.limits.scans) run.limit(D.Scans, `more than ${run.limits.scans} scans`, { limit: run.limits.scans });
+        const v = new View(await r.read(seg.data, n));
+        const ns = n > 0 ? v.u8(0) : 0;
+        if (ns < 1 || ns > 4 || n !== 4 + 2 * ns) run.stop(D.BadHeader, `the scan header names ${ns} components`, loc);
+        const ss = v.u8(1 + ns * 2);
+        const se = v.u8(2 + ns * 2);
+        const ah = v.u8(3 + ns * 2) >> 4;
+        const al = v.u8(3 + ns * 2) & 15;
+        // The entropy tables the scan decodes with, as libjpeg picks them: a progressive DC refinement scan needs none.
+        const usesDc = f.lossless || !f.progressive || (ss === 0 && ah === 0);
+        const usesAc = !f.lossless && (!f.progressive || ss > 0);
+        const inScan = new Set<number>();
+        for (let i = 0; i < ns; i++) {
+          const id = v.u8(1 + i * 2);
+          const tq = f.components.get(id);
+          if (tq === undefined || inScan.has(id)) run.stop(D.BadHeader, `the scan names component ${id} that the frame lacks, or twice`, loc);
+          inScan.add(id);
+          if (!qtables.has(tq ?? 0) && !f.lossless) run.stop(D.BadLayout, `quantization table ${tq} is used before it is defined`, loc);
+          const td = v.u8(2 + i * 2) >> 4;
+          const ta = v.u8(2 + i * 2) & 15;
+          if ((usesDc && td > 3) || (usesAc && ta > 3)) run.stop(D.BadHeader, `the scan names ${usesDc && td > 3 ? `DC table ${td}` : `AC table ${ta}`}, where a JPEG has tables 0 to 3`, loc);
+        }
+        // A refinement scan adds one bit, so its Al is Ah - 1. libjpeg refuses any other pair.
+        if (f.progressive && (ss > se || se > 63 || (ss === 0 && se !== 0) || (ss > 0 && ns !== 1) || ah > 13 || al > 13 || (ah !== 0 && al !== ah - 1)))
+          run.stop(D.BadHeader, 'a progressive scan has parameters outside their range', loc);
+        if (f.lossless && (ss < 1 || ss > 7 || se !== 0 || ah !== 0 || al >= f.precision)) run.stop(D.BadHeader, 'a lossless scan has parameters outside their range', loc);
+        pos = await scanData(seg.end, loc);
+        break;
+      }
+      case 0xfe:
+        run.metadata(D.Comment, loc, seg.start, seg.end, { bytes: n });
+        break;
+      default:
+        if (marker >= 0xe0 && marker <= 0xef) {
+          await app(seg, n);
+          break;
+        }
+        run.stop(D.BadLayout, `${name} is not a marker JPEG defines here`, loc);
+    }
+  }
+
+  /** Reports an APP segment by its identifier. */
+  async function app(seg: Segment, n: number): Promise<void> {
+    const head = await r.read(seg.data, Math.min(n, 64));
+    const id = latin1(head);
+    const extra = (reason: string) => run.extra(seg.loc, seg.start, seg.end, { block: `${markerName(seg.marker)} segment`, reason });
+    switch (seg.marker) {
+      case 0xe0:
+        if (id.startsWith('JFIF\0')) {
+          const v = new View(head);
+          if (n < 14 || n < 14 + 3 * v.u8(12) * v.u8(13)) {
+            run.malformed(seg.loc, seg.start, seg.end, 'the JFIF header is shorter than its thumbnail');
+            return;
+          }
+          if (v.u8(12) * v.u8(13) > 0) {
+            run.metadata(D.Thumbnail, seg.loc, seg.data + 14, seg.end, { format: 'raw' });
+          }
+          return;
+        }
+        if (id.startsWith('JFXX\0') && n >= 6) {
+          const code = head[5];
+          if (code === 0x10) {
+            const thumb = run.metadata(D.Thumbnail, seg.loc, seg.start, seg.end, { offset: seg.data + 6, bytes: n - 6 });
+            await run.contained(seg.loc, seg.data + 6, n - 6, 'image/jpeg', run.keeps(thumb));
+          } else if (code === 0x11 || code === 0x13) run.metadata(D.Thumbnail, seg.loc, seg.start, seg.end, { format: 'raw' });
+          else run.malformed(seg.loc, seg.start, seg.end, `JFXX has the extension code ${code}`);
+          return;
+        }
+        return extra('an APP0 segment other than JFIF');
+      case 0xe1:
+        if (id.startsWith('Exif\0')) {
+          exifCount++;
+          if (exifCount > 1) run.report(C.Structure, D.Ambiguous, seg.loc, { reason: 'a second EXIF segment' });
+          await inspectExif(run, fileSlice(r, seg.data + 6, n - 6), seg.loc, seg.start, seg.end);
+          return;
+        }
+        if (id.startsWith(XMP_ID)) {
+          run.metadata(D.Xmp, seg.loc, seg.start, seg.end, { bytes: n - XMP_ID.length });
+          if (await hasDoctype(fileSlice(r, seg.data + XMP_ID.length, n - XMP_ID.length).chunks())) run.report(C.Metadata, D.Doctype, seg.loc);
+          return;
+        }
+        if (id.startsWith(XMP_EXTENSION_ID)) {
+          // A GUID, the full length and this piece's offset precede the data.
+          if (n < XMP_EXTENSION_ID.length + 40) {
+            run.malformed(seg.loc, seg.start, seg.end, 'an extended XMP segment is cut short');
+            return;
+          }
+          run.metadata(D.Xmp, seg.loc, seg.start, seg.end, { bytes: n - XMP_EXTENSION_ID.length - 40, extended: 'yes' });
+          extended.push(seg);
+          return;
+        }
+        return extra('an APP1 segment other than EXIF or XMP');
+      case 0xe2:
+        if (id.startsWith('ICC_PROFILE\0') && n >= 14) {
+          icc.push({ seq: head[12], count: head[13], start: seg.data + 14, length: n - 14, segment: seg });
+          run.droppableRange(seg.start, seg.end);
+          return;
+        }
+        if (id.startsWith('MPF\0')) {
+          if (mpf) run.report(C.Structure, D.Ambiguous, seg.loc, { reason: 'a second MPF segment' });
+          else mpf = seg;
+          return;
+        }
+        if (id.startsWith('FPXR')) {
+          run.metadata(D.Other, seg.loc, seg.start, seg.end, { kind: 'FlashPix' });
+          return;
+        }
+        return extra('an APP2 segment other than ICC, MPF or FlashPix');
+      case 0xeb:
+        if (id.startsWith('JP')) {
+          run.metadata(D.Other, seg.loc, seg.start, seg.end, { kind: 'JUMBF, such as C2PA content credentials' });
+          return;
+        }
+        return extra('an APP11 segment other than JUMBF');
+      case 0xec:
+        if (id.startsWith('Ducky') || id.startsWith('[picture info]')) {
+          run.metadata(D.Other, seg.loc, seg.start, seg.end, { kind: id.startsWith('Ducky') ? 'Ducky' : 'picture info' });
+          return;
+        }
+        return extra('an APP12 segment other than Ducky or picture info');
+      case 0xed:
+        if (id.startsWith('Photoshop 3.0\0')) {
+          const block = run.metadata(D.Iptc, seg.loc, seg.start, seg.end, { bytes: n });
+          const res = await photoshopResources(fileSlice(r, seg.data + 14, n - 14));
+          if (typeof res === 'string') {
+            run.malformed(seg.loc, seg.start, seg.end, res);
+            return;
+          }
+          for (const t of res.thumbnails) {
+            const at = seg.data + 14 + t.offset;
+            const thumb = run.report(C.Metadata, D.Thumbnail, seg.loc, { offset: at, bytes: t.length });
+            await run.contained(seg.loc, at, t.length, 'image/jpeg', run.keeps(block) && run.keeps(thumb));
+          }
+          return;
+        }
+        return extra('an APP13 segment other than Photoshop resources');
+      case 0xee:
+        if (id.startsWith('Adobe') && n >= 12) return;
+        return extra('an APP14 segment other than Adobe');
+      default:
+        return extra(`an ${markerName(seg.marker)} segment`);
+    }
+  }
+
+  // The ICC profile, split over APP2 segments numbered 1 to n.
+  if (icc.length) {
+    const first = icc[0].segment;
+    const count = icc[0].count;
+    const seqs = icc.map(c => c.seq).sort((a, b) => a - b);
+    const ordered = count > 0 && icc.length === count && icc.every(c => c.count === count) && seqs.every((s, i) => s === i + 1);
+    if (!ordered) run.malformed(first.loc, first.start, first.end, 'the ICC profile chunks do not number 1 to n');
+    else {
+      const parts = [...icc].sort((a, b) => a.seq - b.seq);
+      const why = await checkIcc(
+        joinedSlice(
+          r,
+          parts.map(part => [part.start, part.length]),
+        ),
+      );
+      if (why) run.malformed(first.loc, first.start, first.end, why);
+      else run.metadata(D.IccProfile, first.loc, first.start, first.end, { bytes: parts.reduce((t, part) => t + part.length, 0), segments: parts.length });
+    }
+  }
+  if (extended.length) {
+    const skip = XMP_EXTENSION_ID.length + 40;
+    if (
+      await hasDoctype(
+        joinedSlice(
+          r,
+          extended.map(s => [s.data + skip, s.end - s.data - skip]),
+        ).chunks(),
+      )
+    )
+      run.report(C.Metadata, D.Doctype, extended[0].loc);
+  }
+
+  // After EOI: the images an MPF index names, then gaps and trailing data.
+  const eoiEnd = pos;
+  const images = mpf ? await mpfImages(run, mpf, eoiEnd) : [];
+  let cursor = eoiEnd;
+  for (const img of images) {
+    await run.gap(cursor, img.start, 'hidden');
+    cursor = img.end;
+  }
+  await run.gap(cursor, size, 'trailing');
+}
+
+function unsupported(what: string, loc: string): Error {
+  return new StopError(C.Format, D.Unsupported, `${what} is not read by this version`, { format: what }, loc);
+}
+
+/**
+ * Reads the MPF index and reports the images it names after EOI. Returns their ranges in file order, or none when the
+ * index is malformed.
+ */
+async function mpfImages(run: Run, seg: Segment, eoiEnd: number): Promise<Array<{ start: number; end: number }>> {
+  const r = run.reader;
+  const base = seg.data + 4;
+  const index = run.metadata(D.Other, seg.loc, seg.start, seg.end, { kind: 'multi-picture index' });
+  const found: Array<{ start: number; end: number }> = [];
+  try {
+    const ifds = await IfdReader.open(fileSlice(r, base, seg.end - base));
+    const ifd = await ifds.ifd(ifds.first);
+    const entries = ifd.byTag.get(0xb002);
+    if (!entries || entries.size % 16 !== 0) throw new IfdError(D.BadLayout, 'the MPF index has no image list');
+    const v = new View(await ifds.slice.read(entries.at, entries.size), ifds.little);
+    for (let i = 1; i < entries.size / 16; i++) {
+      const length = v.u32(i * 16 + 4);
+      const offset = v.u32(i * 16 + 8);
+      const start = base + offset;
+      if (length === 0 || offset === 0 || start < eoiEnd || start + length > run.size) throw new IfdError(D.Truncated, 'an MPF image lies outside the data after EOI');
+      found.push({ start, end: start + length });
+    }
+    found.sort((a, b) => a.start - b.start);
+    for (let i = 1; i < found.length; i++) if (found[i].start < found[i - 1].end) throw new IfdError(D.Overlap, 'two MPF images overlap');
+  } catch (e) {
+    if (!(e instanceof IfdError)) throw e;
+    run.malformed(seg.loc, seg.start, seg.end, `MPF: ${e.message}`);
+    return [];
+  }
+  for (const img of found) {
+    const loc = `secondary image at ${img.start}`;
+    const f = run.metadata(D.SecondaryImage, loc, img.start, img.end, { offset: img.start, bytes: img.end - img.start });
+    await run.contained(loc, img.start, img.end - img.start, 'image/jpeg', run.keeps(index) && run.keeps(f));
+  }
+  return found;
+}

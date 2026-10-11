@@ -1,0 +1,332 @@
+{
+  "bmp-2bpp.bmp": {
+    "issue": "A 2-bit-per-pixel BMP, legal on Windows CE and read by image-rs in its default mode.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    }
+  },
+  "bmp-os2-short-palette.bmp": {
+    "issue": "An OS/2 1.x BMP (12-byte header) whose palette holds fewer than 2^bpp entries, its length set by where the pixels start.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/TRUNCATED"
+      ]
+    }
+  },
+  "gif-mincodesize-0.gif": {
+    "issue": "A GIF with an LZW minimum code size of 0, which stays refused.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    }
+  },
+  "gif-mincodesize-1.gif": {
+    "issue": "A GIF with an LZW minimum code size of 1, read by image-gif, Wuffs, Firefox and Pillow.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    }
+  },
+  "ico-large-image.ico": {
+    "issue": "An ICO whose image is 300 pixels wide, so the one-byte directory field holds 44, its low byte. A large icon, not an ambiguous one.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/AMBIGUOUS"
+      ]
+    }
+  },
+  "ico-missing-and-mask.ico": {
+    "issue": "A 32-bit icon whose doubled header height promises an AND mask the directory entry does not include. The icon is truncated.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/TRUNCATED"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/TRUNCATED"
+      ]
+    }
+  },
+  "ico-size-mismatch.ico": {
+    "issue": "An ICO whose directory says 16x32 for a 16x16 image, both small enough to encode, so the mismatch is a genuine disagreement readers resolve differently.",
+    "expect": {
+      "status": "rejected",
+      "risk": "NONE",
+      "kinds": [
+        "STRUCTURE/AMBIGUOUS"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/AMBIGUOUS"
+      ]
+    }
+  },
+  "jpeg-ac-table-4.jpg": {
+    "issue": "A JPEG scan that selects AC Huffman table 4, past the 0 to 3 a JPEG defines. libjpeg rejects it; the package did not.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "jpeg-bad-refinement.jpg": {
+    "issue": "A progressive JPEG scan with Ah=2 and Al=0, where a refinement scan must have Al=Ah-1. libjpeg rejects it; the package did not.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "jpeg-trailing-byte.jpg": {
+    "issue": "A valid JPEG with one non-zero byte after EOI: trailing data to strip, not a reason to reject.",
+    "expect": {
+      "status": "strippable",
+      "risk": "LOW",
+      "kinds": [
+        "STRUCTURE/TRAILING_DATA"
+      ]
+    },
+    "beforeRound2": {
+      "status": "strippable",
+      "kinds": [
+        "STRUCTURE/TRAILING_DATA"
+      ]
+    }
+  },
+  "jpeg-valid.jpg": {
+    "issue": "A structurally valid baseline JPEG. The package reads no entropy data, so a JPEG whose only fault is one decoder's pixel math is clean.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "png-ancillary-bad-crc.png": {
+    "issue": "A PNG ancillary chunk with a stale CRC, which libpng warns past and image-png skips by default. The chunk is dropped, not a reason to reject.",
+    "expect": {
+      "status": "strippable",
+      "risk": "LOW",
+      "kinds": [
+        "STRUCTURE/EXTRA_BLOCK"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_CHECKSUM"
+      ]
+    }
+  },
+  "png-bad-color-type.png": {
+    "issue": "A PNG with color type 9, which no decoder defines: a deliberately broken file that stays refused.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_HEADER"
+      ]
+    }
+  },
+  "png-critical-bad-crc.png": {
+    "issue": "A PNG whose IHDR CRC does not match. A critical chunk with a bad CRC still refuses the file.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_CHECKSUM"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_CHECKSUM"
+      ]
+    }
+  },
+  "png-partial-image.png": {
+    "issue": "A PNG that re-encodes a partially decoded image whole. Nothing in the PNG is cut, so it is clean.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "png-pdf-in-pixels.png": {
+    "issue": "A PNG whose compressed pixels decode to bytes that contain %PDF-, but no %PDF- sits in the raw file, so no PDF reader opens it.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "png-truncated-idat.png": {
+    "issue": "A genuinely truncated PNG (the IDAT stream is cut and IEND is gone), so the truncation check is shown to catch a real cut.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/TRUNCATED"
+      ]
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/TRUNCATED"
+      ]
+    }
+  },
+  "tiff-extra-tiles.tif": {
+    "issue": "A tiled TIFF whose TileOffsets and TileByteCounts list more tiles than the grid needs, which readers take from the arrays.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_LAYOUT"
+      ]
+    }
+  },
+  "tiff-null-entry.tif": {
+    "issue": "A TIFF whose IFD holds a null (type 0) padding entry, which libtiff skips. CR2-style single-strip OJPEG files carry these.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "rejected",
+      "kinds": [
+        "STRUCTURE/BAD_LAYOUT"
+      ]
+    }
+  },
+  "tiff-old-jpeg.tif": {
+    "issue": "A TIFF with old-style JPEG compression whose quantization and Huffman tables live in regions tags 519, 520 and 521 point at. Those regions are image structure, not hidden data.",
+    "expect": {
+      "status": "clean",
+      "risk": "LOW",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "strippable",
+      "kinds": [
+        "STRUCTURE/HIDDEN_DATA"
+      ]
+    }
+  },
+  "webp-vp8l-incomplete-code.webp": {
+    "issue": "CVE-2023-4863: a VP8L lossless Huffman code that is incomplete, the kind libwebp's fixed table builder rejects. Decodes no pixels.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_DATA"
+      ]
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "webp-vp8l-oversubscribed-code.webp": {
+    "issue": "CVE-2023-4863: a VP8L code-length code that is over-subscribed, the other shape libwebp's fixed table builder rejects.",
+    "expect": {
+      "status": "rejected",
+      "risk": "UNKNOWN",
+      "kinds": [
+        "STRUCTURE/BAD_DATA"
+      ]
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  },
+  "webp-vp8l-valid.webp": {
+    "issue": "A valid minimal VP8L stream, so the ported libwebp check walks a whole stream without a false positive.",
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "clean",
+      "kinds": []
+    }
+  }
+}
