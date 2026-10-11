@@ -1,9 +1,12 @@
+import { type PhotoshopEdit, photoshopEdits } from './blocks';
 import type { Run } from './context';
 import { StopError } from './errors';
-import { type Ifd, IfdError, IfdReader } from './ifd';
+import { type Ifd, IfdError, IfdReader, typeSize } from './ifd';
 import { checkIcc, hasDoctype, photoshopResources } from './metadata';
+import { lengthOf, type Piece, Region } from './rewrite';
 import { fileSlice } from './slice';
-import { ImageCategory as C, ImageDetail as D } from './types';
+import { TiffRewrite, walkIfds } from './tiffedit';
+import { ImageCategory as C, ImageDetail as D, type DefuseFinding, type ImageFinding } from './types';
 
 /** Compression schemes read: none, CCITT RLE, G3 and G4, LZW, old and new JPEG, Deflate twice, PackBits, LZMA, Zstandard and WebP. */
 const COMPRESSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 32773, 32946, 34925, 50000, 50001]);
@@ -74,6 +77,31 @@ class Ranges {
   }
 }
 
+/** How an image IFD lays out its strips or tiles, for the rewrite to keep each one, cut to its rows when uncompressed. */
+interface Layout {
+  tiles: boolean;
+  compression: number;
+  /** Strips or tiles the image needs. */
+  count: number;
+  perPlaneCount: number;
+  rowsEach: number;
+  bytesPerRow: number;
+  height: number;
+  /** Old-style JPEG data and tables, which strips may share bytes with. */
+  ojpeg: Array<[number, number]>;
+}
+
+/** What the rewrite needs of a TIFF file, keyed by the file offsets of entries and IFDs. */
+export interface TiffPlan {
+  /** Entries of image IFDs that a finding or a signature can remove, with those findings. */
+  entries: Map<number, Array<DefuseFinding | undefined>>;
+  /** EXIF, GPS and interoperability IFDs that a finding can remove, with the ranges a signature in them can sit in. */
+  ifds: Map<number, { findings: Array<DefuseFinding | undefined>; ranges: Array<[number, number]> }>;
+  /** Photoshop resources holding thumbnails, by their entry. */
+  photoshop: Map<number, PhotoshopEdit[]>;
+  layouts: Map<number, Layout>;
+}
+
 interface Item {
   offset: number;
   kind: 'image' | 'exif' | 'gps' | 'interop';
@@ -82,18 +110,19 @@ interface Item {
   index: number;
 }
 
-export async function inspectTiff(run: Run): Promise<void> {
+export async function inspectTiff(run: Run): Promise<TiffPlan> {
   try {
-    await walk(run);
+    return await walk(run);
   } catch (e) {
     if (e instanceof IfdError) run.stop(e.detail, e.message);
     throw e;
   }
 }
 
-async function walk(run: Run): Promise<void> {
+async function walk(run: Run): Promise<TiffPlan> {
   const r = run.reader;
   const size = run.size;
+  const plan: TiffPlan = { entries: new Map(), ifds: new Map(), photoshop: new Map(), layouts: new Map() };
   const ifds = await IfdReader.open(fileSlice(r, 0, size));
   const ranges = new Ranges();
   ranges.add(0, ifds.headerSize, 'header');
@@ -115,21 +144,27 @@ async function walk(run: Run): Promise<void> {
     run.block(ifd.entries.length + 1);
     ranges.add(ifd.start, ifd.end, 'ifd');
     for (const e of ifd.entries) if (!e.inline) ranges.add(e.at, e.at + e.size, 'value');
-    if (ifd.duplicates.length) run.report(C.Structure, D.Ambiguous, item.label, { reason: `tags given twice: ${[...new Set(ifd.duplicates)].join(', ')}` });
+    const twice = ifd.duplicates.length ? run.report(C.Structure, D.Ambiguous, item.label, { reason: `tags given twice: ${[...new Set(ifd.duplicates)].join(', ')}` }) : undefined;
+    const values: Array<[number, number]> = ifd.entries.filter(e => !e.inline).map(e => [e.at, e.at + e.size]);
 
     if (item.kind === 'exif') {
-      run.metadata(D.Exif, item.label, ifd.start, ifd.end, { entries: ifd.entries.length });
-      for (const e of ifd.entries) if (!e.inline) run.droppableRange(e.at, e.at + e.size);
+      const f = run.metadata(D.Exif, item.label, ifd.start, ifd.end, { entries: ifd.entries.length });
+      for (const [a, b] of values) run.droppableRange(a, b);
+      plan.ifds.set(ifd.start, { findings: [f, twice], ranges: [[ifd.start, ifd.end], ...values] });
       const interop = await ifds.number(ifd, 40965);
       if (interop) queue.push({ offset: interop, kind: 'interop', label: `interoperability IFD at ${interop}`, index: -1 });
       continue;
     }
     if (item.kind === 'gps') {
-      for (const e of ifd.entries) if (!e.inline) run.droppableRange(e.at, e.at + e.size);
-      if (ifd.entries.length) run.metadata(D.Gps, item.label, ifd.start, ifd.end, { entries: ifd.entries.length });
+      for (const [a, b] of values) run.droppableRange(a, b);
+      const f = ifd.entries.length ? run.metadata(D.Gps, item.label, ifd.start, ifd.end, { entries: ifd.entries.length }) : undefined;
+      plan.ifds.set(ifd.start, { findings: [f, twice], ranges: [[ifd.start, ifd.end], ...values] });
       continue;
     }
-    if (item.kind === 'interop') continue;
+    if (item.kind === 'interop') {
+      plan.ifds.set(ifd.start, { findings: [twice], ranges: [] });
+      continue;
+    }
 
     if (ifd.next) {
       const index = item.index >= 0 ? item.index + 1 : -1;
@@ -143,8 +178,8 @@ async function walk(run: Run): Promise<void> {
     if (exif) queue.push({ offset: exif, kind: 'exif', label: `EXIF IFD at ${exif}`, index: -1 });
     const gps = await ifds.number(ifd, 34853);
     if (gps) queue.push({ offset: gps, kind: 'gps', label: `GPS IFD at ${gps}`, index: -1 });
-    await tags(run, ifd, item.label);
-    await image(run, ifds, ifd, item.label, ranges);
+    await tags(run, ifd, item.label, twice, plan);
+    plan.layouts.set(ifd.start, await image(run, ifds, ifd, item.label, ranges));
   }
 
   // Every range the file uses, checked for overlaps; the bytes between them are gaps.
@@ -168,55 +203,71 @@ async function walk(run: Run): Promise<void> {
     }
   }
   await run.gap(end, size, 'trailing');
+  return plan;
 }
 
-/** Reports the metadata and extra tags of an image IFD. */
-async function tags(run: Run, ifd: Ifd, label: string): Promise<void> {
+/**
+ * Reports the metadata and extra tags of an image IFD, and records for each entry the rewrite can remove the findings
+ * that decide it. `twice` is the IFD's finding for tags given twice, which decides the copies after the first.
+ */
+async function tags(run: Run, ifd: Ifd, label: string, twice: ImageFinding | undefined, plan: TiffPlan): Promise<void> {
   const r = run.reader;
   const text: number[] = [];
   const extra: number[] = [];
-  const other = new Set<string>();
+  const other = new Map<string, number[]>();
+  // Text, the other metadata kinds and extra tags get one finding per IFD, made once the whole IFD is read.
+  const later: Array<{ pos: number; group: string }> = [];
+  const record = (pos: number, ...findings: Array<DefuseFinding | undefined>) => plan.entries.set(pos, [...(plan.entries.get(pos) ?? []), ...findings]);
   for (const e of ifd.entries) {
     const range = (): [number, number] => (e.inline ? [0, 0] : [e.at, e.at + e.size]);
+    if (ifd.byTag.get(e.tag) !== e) record(e.pos, twice);
     if (STRUCTURE.has(e.tag)) continue;
     if (TEXT.has(e.tag)) {
       text.push(e.tag);
       run.droppableRange(...range());
+      later.push({ pos: e.pos, group: 'text' });
     } else if (OTHER.has(e.tag)) {
-      other.add(OTHER.get(e.tag) ?? '');
+      const kind = OTHER.get(e.tag) ?? '';
+      other.set(kind, [...(other.get(kind) ?? []), e.tag]);
       run.droppableRange(...range());
+      later.push({ pos: e.pos, group: `other:${kind}` });
     } else if (e.tag === 700) {
-      run.metadata(D.Xmp, `${label}, tag 700`, ...range(), { bytes: e.size });
-      if (await hasDoctype(fileSlice(r, e.at, e.size).chunks())) run.report(C.Metadata, D.Doctype, `${label}, tag 700`);
+      const xmp = run.metadata(D.Xmp, `${label}, tag 700`, ...range(), { bytes: e.size });
+      record(e.pos, xmp, (await hasDoctype(fileSlice(r, e.at, e.size).chunks())) ? run.report(C.Metadata, D.Doctype, `${label}, tag 700`) : undefined);
     } else if (e.tag === 34675) {
       const why = await checkIcc(fileSlice(r, e.at, e.size));
-      if (why) run.malformed(`${label}, tag 34675`, ...range(), why);
-      else run.metadata(D.IccProfile, `${label}, tag 34675`, ...range(), { bytes: e.size });
+      record(e.pos, why ? run.malformed(`${label}, tag 34675`, ...range(), why) : run.metadata(D.IccProfile, `${label}, tag 34675`, ...range(), { bytes: e.size }));
     } else if (e.tag === 33723) {
-      run.metadata(D.Iptc, `${label}, tag 33723`, ...range(), { bytes: e.size });
+      record(e.pos, run.metadata(D.Iptc, `${label}, tag 33723`, ...range(), { bytes: e.size }));
     } else if (e.tag === 34377) {
       const loc = `${label}, tag 34377`;
       const block = run.metadata(D.Iptc, loc, ...range(), { bytes: e.size });
+      record(e.pos, block);
       const res = await photoshopResources(fileSlice(r, e.at, e.size));
-      if (typeof res === 'string') run.malformed(loc, ...range(), res);
-      else {
+      if (typeof res === 'string') record(e.pos, run.malformed(loc, ...range(), res));
+      else if (res.thumbnails.length) {
+        const edits: PhotoshopEdit[] = [];
         for (const t of res.thumbnails) {
           const thumb = run.report(C.Metadata, D.Thumbnail, loc, { offset: e.at + t.offset, bytes: t.length });
-          await run.contained(loc, e.at + t.offset, t.length, 'image/jpeg', run.keeps(block) && run.keeps(thumb));
+          edits.push({ thumbnail: t, contained: await run.contained(loc, 'Photoshop thumbnail', e.at + t.offset, t.length, 'image/jpeg', run.keeps(block) && run.keeps(thumb)) });
         }
+        plan.photoshop.set(e.pos, edits);
       }
     } else {
       extra.push(e.tag);
       run.droppableRange(...range());
+      later.push({ pos: e.pos, group: 'extra' });
     }
   }
-  if (text.length) run.metadata(D.Text, label, 0, 0, { tags: text.join(', ') });
-  for (const kind of other) run.metadata(D.Other, label, 0, 0, { kind });
-  if (extra.length) run.report(C.Structure, D.ExtraBlock, label, { block: `tags ${extra.join(', ')}`, tags: extra.join(', ') });
+  const groups = new Map<string, ImageFinding>();
+  if (text.length) groups.set('text', run.metadata(D.Text, label, 0, 0, { tags: text.join(', ') }));
+  for (const [kind] of other) groups.set(`other:${kind}`, run.metadata(D.Other, label, 0, 0, { kind }));
+  if (extra.length) groups.set('extra', run.report(C.Structure, D.ExtraBlock, label, { block: `tags ${extra.join(', ')}`, tags: extra.join(', ') }));
+  for (const l of later) record(l.pos, groups.get(l.group));
 }
 
 /** Checks an image IFD's size, samples, compression, and strips or tiles. */
-async function image(run: Run, ifds: IfdReader, ifd: Ifd, label: string, ranges: Ranges): Promise<void> {
+async function image(run: Run, ifds: IfdReader, ifd: Ifd, label: string, ranges: Ranges): Promise<Layout> {
   const num = (tag: number, fallback?: number) => ifds.number(ifd, tag, fallback);
   const width = await num(256);
   const height = await num(257);
@@ -294,17 +345,22 @@ async function image(run: Run, ifds: IfdReader, ifd: Ifd, label: string, ranges:
       ranges.add(at, at + want, kind);
     } else ranges.add(at, at + n, kind);
   }
+  const ojpeg: Array<[number, number]> = [];
+  const old = (from: number, to: number) => {
+    ranges.add(from, to, 'ojpeg');
+    ojpeg.push([from, to]);
+  };
   const jpegAt = await num(513);
   const jpegLength = await num(514);
   if (jpegAt !== undefined && jpegLength !== undefined && jpegLength > 0) {
     if (jpegAt + jpegLength > run.size) run.stop(D.Truncated, 'the old-style JPEG data runs past the end of the file', label);
-    ranges.add(jpegAt, jpegAt + jpegLength, 'ojpeg');
+    old(jpegAt, jpegAt + jpegLength);
   }
   // Old-style JPEG stores its quantization tables (tag 519, 64 bytes each) and its Huffman tables (tags 520 and 521,
   // 16 count bytes then that many values) in regions these tags point at. They are image structure, not gaps.
   if (compression === 6) {
     const quant = ifd.byTag.get(519);
-    if (quant) for (const at of await ifds.numbers(quant)) if (at > 0 && at + 64 <= run.size) ranges.add(at, at + 64, 'ojpeg');
+    if (quant) for (const at of await ifds.numbers(quant)) if (at > 0 && at + 64 <= run.size) old(at, at + 64);
     for (const tag of [520, 521]) {
       const entry = ifd.byTag.get(tag);
       if (!entry) continue;
@@ -313,10 +369,78 @@ async function image(run: Run, ifds: IfdReader, ifd: Ifd, label: string, ranges:
         const bits = await run.reader.read(at, 16);
         let total = 16;
         for (const b of bits) total += b;
-        if (at + total <= run.size) ranges.add(at, at + total, 'ojpeg');
+        if (at + total <= run.size) old(at, at + total);
       }
     }
   }
+  return { tiles, compression, count, perPlaneCount, rowsEach, bytesPerRow, height: h, ojpeg };
+}
+
+/**
+ * The TIFF as the rewrite writes it. Entries, EXIF and GPS IFDs that a finding or a signature removes go, and so do
+ * Photoshop thumbnails that go. Every byte no kept IFD, value, strip, tile or old-style JPEG range covers is removed,
+ * which takes gaps and trailing data with it, and uncompressed strips are cut to their rows. Every offset is then
+ * written for where its target lands.
+ */
+export async function tiffPieces(run: Run, plan: TiffPlan): Promise<Piece[]> {
+  const r = await IfdReader.open(fileSlice(run.reader, 0, run.size));
+  const ifds = await walkIfds(r, true);
+  const t = new TiffRewrite(r, 0, ifds);
+  for (const w of ifds) {
+    run.time();
+    const decided = plan.ifds.get(w.ifd.start);
+    if (w.kind !== 'chain' && w.kind !== 'sub') {
+      if (decided && (decided.findings.some(f => f !== undefined && !run.keeps(f)) || decided.ranges.some(([a, b]) => run.drops([], a, b)))) t.dropIfd(w);
+      continue;
+    }
+    for (const e of w.ifd.entries) {
+      const findings = plan.entries.get(e.pos);
+      if (findings && run.drops(findings, e.inline ? 0 : e.at, e.inline ? 0 : e.at + e.size)) {
+        t.dropEntry(e);
+        continue;
+      }
+      const edits = plan.photoshop.get(e.pos);
+      if (!edits) continue;
+      const region = new Region(e.at, e.at + e.size);
+      if (!photoshopEdits(run, region, e.at, edits)) continue;
+      // A value whose type is wider than a byte cannot change length by a thumbnail's bytes, so it goes instead.
+      if (typeSize(e.type) !== 1) t.dropEntry(e);
+      else {
+        const pieces = region.pieces();
+        t.replaceValue(e, pieces, lengthOf(pieces));
+      }
+    }
+    const layout = plan.layouts.get(w.ifd.start);
+    if (!layout) continue;
+    const offsetsEntry = w.ifd.byTag.get(layout.tiles ? 324 : 273);
+    const countsEntry = w.ifd.byTag.get(layout.tiles ? 325 : 279);
+    if (!offsetsEntry || !countsEntry) continue;
+    const offsets = await r.numbers(offsetsEntry);
+    const counts = await r.numbers(countsEntry);
+    // Strips written end to end, the usual layout, are kept as one range.
+    let from = -1;
+    let to = -1;
+    for (let i = 0; i < offsets.length; i++) {
+      const n = counts[i];
+      if (!n) continue;
+      const at = offsets[i];
+      let keep = n;
+      if (layout.compression === 1 && i < layout.count) {
+        const rows = layout.tiles ? layout.rowsEach : Math.min(layout.rowsEach, layout.height - (i % layout.perPlaneCount) * layout.rowsEach);
+        keep = Math.min(n, rows * layout.bytesPerRow);
+        if (keep < n) t.setValue(countsEntry, i, keep);
+      }
+      if (at === to) to = at + keep;
+      else {
+        if (to > from) t.keepRange(from, to);
+        from = at;
+        to = at + keep;
+      }
+    }
+    if (to > from) t.keepRange(from, to);
+    for (const [a, b] of layout.ojpeg) t.keepRange(a, b);
+  }
+  return t.pieces(true);
 }
 
 function unsupported(what: string, loc: string): Error {

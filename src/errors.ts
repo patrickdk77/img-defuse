@@ -6,6 +6,20 @@ export class TimeLimitError extends Error {
   readonly limit = 'time';
 }
 
+/** An image deeper in the upload than limits.nestingDepth allows. The code makes every package pass it up. */
+export class NestingLimitError extends Error {
+  readonly code = 'DEFUSE_LIMIT';
+  readonly limit = 'nesting';
+}
+
+/** An I/O error inside a nested image's own run, carried up so the upload's run fails on it as on its own. */
+export class NestedIoError extends Error {
+  readonly code = 'DEFUSE_IO';
+  constructor(cause: unknown) {
+    super(String((cause as Error)?.message ?? cause), { cause });
+  }
+}
+
 /**
  * A refusal or a limit that stops the run. The engine turns it into the finding it names and rejects the file with
  * no score, whatever the overrides say.

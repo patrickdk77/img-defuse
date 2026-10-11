@@ -2,12 +2,14 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { expect } from 'chai';
 import { inspectImage } from '../src';
-import type { DefuseFinding } from '../src/types';
+import type { DefuseFinding, ImageOptions } from '../src/types';
 import { fixtures } from './helpers/util';
 
 /** One crafted fixture per issue a corpus run of the package exposed, each rebuilt from scratch by scripts/make-fixtures.py. */
 interface Entry {
   issue: string;
+  /** Options the issue shows under, when it needs any. */
+  options?: ImageOptions;
   expect: { status: string; risk: string; kinds: string[] };
   beforeRound2: { status: string; kinds: string[] };
 }
@@ -33,7 +35,7 @@ describe('corpus cases', () => {
 
   for (const [name, entry] of Object.entries(manifest)) {
     it(`inspects ${name} as the manifest expects`, async () => {
-      const r = await inspectImage(fs.readFileSync(path.join(casesDir, name)));
+      const r = await inspectImage(fs.readFileSync(path.join(casesDir, name)), entry.options);
       expect([r.status, r.risk, actedKinds(r.findings)], name).to.deep.equal([entry.expect.status, entry.expect.risk, [...entry.expect.kinds].sort()]);
     });
   }

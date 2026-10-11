@@ -328,5 +328,20 @@
       "status": "clean",
       "kinds": []
     }
+  },
+  "jpeg-exif-orientation-only.jpg": {
+    "issue": "An EXIF block that holds only an orientation of 6. With stripMetadata it is already what the rewrite writes in its place, so it gets no METADATA/STRIPPED finding and a defused copy disarms as clean.",
+    "options": {
+      "stripMetadata": true
+    },
+    "expect": {
+      "status": "clean",
+      "risk": "NONE",
+      "kinds": []
+    },
+    "beforeRound2": {
+      "status": "strippable",
+      "kinds": []
+    }
   }
 }

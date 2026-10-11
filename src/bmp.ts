@@ -1,11 +1,22 @@
 import type { Run } from './context';
 import { StopError } from './errors';
 import { checkIcc } from './metadata';
+import { ascii, bytes, copy, type Piece, u16, u32 } from './rewrite';
 import { fileSlice, latin1, View } from './slice';
-import { ImageCategory as C, ImageDetail as D } from './types';
+import { ImageCategory as C, ImageDetail as D, type DefuseFinding } from './types';
 
 const PROFILE_LINKED = 0x4c494e4b;
 const PROFILE_EMBEDDED = 0x4d424544;
+const LCS_SRGB = 0x73524742;
+
+/** What the rewrite needs of a BMP: the info header and masks, then the file ranges of the palette, pixels and profile. */
+export interface BmpPlan {
+  headerSize: number;
+  maskBytes: number;
+  palette: [number, number];
+  pixels: [number, number];
+  profile?: { start: number; end: number; findings: Array<DefuseFinding | undefined> };
+}
 
 export interface Dib {
   headerSize: number;
@@ -47,8 +58,11 @@ function contiguous(mask: number): boolean {
   return (x & (x + 1)) === 0;
 }
 
-/** Reads a DIB info header at `at`. In an icon the height counts the AND mask too, and only uncompressed data is allowed. */
-export async function readDib(run: Run, at: number, end: number, loc: string, icon: boolean): Promise<Dib> {
+/**
+ * Reads a DIB info header at `at`. In an icon the height counts the AND mask too, and only uncompressed data is allowed.
+ * `embedded` marks a DIB inside a metafile record, whose data may be a JPEG or PNG file (compression 4 or 5).
+ */
+export async function readDib(run: Run, at: number, end: number, loc: string, icon: boolean, embedded = false): Promise<Dib> {
   const r = run.reader;
   if (at + 4 > end) run.stop(D.Truncated, 'the info header is cut short', loc);
   const headerSize = new View(await r.read(at, 4), true).u32(0);
@@ -75,13 +89,17 @@ export async function readDib(run: Run, at: number, end: number, loc: string, ic
     compression = v.u32(16);
     colorsUsed = v.u32(32);
   }
-  if (compression === 4 || compression === 5) unsupported(compression === 4 ? 'JPEG in BMP' : 'PNG in BMP', loc);
+  if ((compression === 4 || compression === 5) && !embedded) unsupported(compression === 4 ? 'JPEG in BMP' : 'PNG in BMP', loc);
   if (compression >= 11 && compression <= 13) unsupported('CMYK BMP', loc);
   if (width <= 0) run.stop(D.BadHeader, `the width is ${width}`, loc);
   if (rawHeight === 0 || rawHeight === -2147483648) run.stop(D.BadHeader, `the height is ${rawHeight}`, loc);
   const topDown = rawHeight < 0;
   let height = Math.abs(rawHeight);
   if (planes !== 1) run.stop(D.BadHeader, `the image has ${planes} planes`, loc);
+  if (compression === 4 || compression === 5) {
+    // The data is a whole JPEG or PNG file, which the record that holds it hands to the file plugins.
+    return { headerSize, width, height, topDown, bpp, compression, maskBytes: 0, paletteEntries: 0, paletteEntrySize: 4, stride: 0, csType: 0, profileData: 0, profileSize: 0 };
+  }
   if (!PAIRS.get(compression)?.includes(bpp)) run.stop(D.BadHeader, `compression ${compression} with ${bpp} bits per pixel`, loc);
   if (topDown && compression !== 0 && compression !== 3 && compression !== 6) run.stop(D.BadHeader, 'a top-down image is compressed', loc);
   if (icon) {
@@ -129,13 +147,13 @@ export async function readDib(run: Run, at: number, end: number, loc: string, ic
   };
 }
 
-/** Walks RLE4 or RLE8 data from `at` to its end-of-bitmap command. Returns the offset after it. */
-async function walkRle(run: Run, at: number, dib: Dib, loc: string): Promise<number> {
+/** Walks RLE4 or RLE8 data from `at` to its end-of-bitmap command, inside [at, limit). Returns the offset after it. */
+export async function walkRle(run: Run, at: number, dib: Dib, loc: string, limit = run.size): Promise<number> {
   const r = run.reader;
   let window: Uint8Array = new Uint8Array(0);
   let windowAt = at;
   const byte = async (q: number): Promise<number> => {
-    if (q >= run.size) run.stop(D.Truncated, 'the RLE data ends before its end-of-bitmap command', loc);
+    if (q >= limit) run.stop(D.Truncated, 'the RLE data ends before its end-of-bitmap command', loc);
     if (q < windowAt || q >= windowAt + window.length) {
       run.time();
       windowAt = q;
@@ -170,9 +188,9 @@ async function walkRle(run: Run, at: number, dib: Dib, loc: string): Promise<num
     } else {
       if (y >= dib.height || x + b > dib.width) outside('literal run');
       x += b;
-      const bytes = dib.compression === 1 ? b : Math.ceil(b / 2);
-      p += bytes + (bytes & 1);
-      if (p > run.size) run.stop(D.Truncated, 'the RLE data ends inside a literal run', loc);
+      const literal = dib.compression === 1 ? b : Math.ceil(b / 2);
+      p += literal + (literal & 1);
+      if (p > limit) run.stop(D.Truncated, 'the RLE data ends inside a literal run', loc);
     }
   }
 }
@@ -191,7 +209,7 @@ async function layout(run: Run, ranges: Array<{ start: number; end: number; what
   await run.gap(p, run.size, 'trailing');
 }
 
-export async function inspectBmp(run: Run): Promise<void> {
+export async function inspectBmp(run: Run): Promise<BmpPlan> {
   const r = run.reader;
   const size = run.size;
   if (size < 18) run.stop(D.Truncated, 'the file header is cut short', 'file header');
@@ -218,6 +236,7 @@ export async function inspectBmp(run: Run): Promise<void> {
     if (pixelEnd > size) run.stop(D.Truncated, `the pixel data needs ${dib.stride * dib.height} bytes`, pixelLoc);
   }
   ranges.push({ start: pixelOffset, end: pixelEnd, what: 'pixel data' });
+  const plan: BmpPlan = { headerSize: dib.headerSize, maskBytes: dib.maskBytes, palette: [paletteStart, paletteEnd], pixels: [pixelOffset, pixelEnd] };
   if (dib.csType === PROFILE_LINKED || dib.csType === PROFILE_EMBEDDED) {
     const start = 14 + dib.profileData;
     const end = start + dib.profileSize;
@@ -228,12 +247,48 @@ export async function inspectBmp(run: Run): Promise<void> {
       const raw = await r.read(start, Math.min(dib.profileSize, 1024));
       const nul = raw.indexOf(0);
       run.droppableRange(start, end);
-      run.report(C.External, D.LinkedProfile, ploc, { target: latin1(nul < 0 ? raw : raw.subarray(0, nul)) });
+      plan.profile = { start, end, findings: [run.report(C.External, D.LinkedProfile, ploc, { target: latin1(nul < 0 ? raw : raw.subarray(0, nul)) })] };
     } else {
       const why = await checkIcc(fileSlice(r, start, dib.profileSize));
-      if (why) run.malformed(ploc, start, end, why);
-      else run.metadata(D.IccProfile, ploc, start, end, { bytes: dib.profileSize });
+      plan.profile = { start, end, findings: [why ? run.malformed(ploc, start, end, why) : run.metadata(D.IccProfile, ploc, start, end, { bytes: dib.profileSize })] };
     }
   }
   await layout(run, ranges, loc);
+  return plan;
+}
+
+/**
+ * The BMP as the rewrite writes it: a new file header, the info header, masks, palette and pixel data end to end, and
+ * the color profile after the pixels when it stays. A profile that goes, a linked one included, leaves the image in
+ * sRGB.
+ */
+export async function bmpPieces(run: Run, plan: BmpPlan): Promise<Piece[]> {
+  const p = plan.profile;
+  const profileKept = p !== undefined && !run.drops(p.findings, p.start, p.end);
+  const infoEnd = 14 + plan.headerSize + plan.maskBytes;
+  const pixelOffset = infoEnd + plan.palette[1] - plan.palette[0];
+  const pixelLength = plan.pixels[1] - plan.pixels[0];
+  const profileLength = profileKept && p ? p.end - p.start : 0;
+  const info = Uint8Array.from(await run.reader.read(14, plan.headerSize));
+  if (p) {
+    const v = new DataView(info.buffer);
+    if (profileKept) v.setUint32(112, pixelOffset + pixelLength - 14, true);
+    else {
+      v.setUint32(56, LCS_SRGB, true);
+      v.setUint32(112, 0, true);
+      v.setUint32(116, 0, true);
+    }
+  }
+  const out: Piece[] = [
+    bytes(ascii('BM')),
+    bytes(u32(pixelOffset + pixelLength + profileLength, true)),
+    bytes(u16(0)),
+    bytes(u16(0)),
+    bytes(u32(pixelOffset, true)),
+    bytes(info),
+    copy(14 + plan.headerSize, plan.maskBytes + plan.palette[1] - plan.palette[0]),
+    copy(plan.pixels[0], pixelLength),
+  ];
+  if (profileKept && p) out.push(copy(p.start, profileLength));
+  return out;
 }

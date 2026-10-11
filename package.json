@@ -1,7 +1,7 @@
 {
   "name": "@patrickdk77/img-defuse",
-  "version": "0.1.1",
-  "description": "Inspect PNG, JPEG, GIF, WebP, TIFF, BMP and ICO images for structure that readers disagree on, decompression and dimension bombs, trailing and hidden data, polyglots and metadata, and score the risk. Strict parsers, bounded memory, no runtime dependencies.",
+  "version": "0.2.0",
+  "description": "Inspect and defuse PNG, JPEG, GIF, WebP, TIFF, BMP and ICO images. Finds structure that readers disagree on, decompression and dimension bombs, trailing and hidden data, polyglots and metadata, scores the risk, and writes a copy without them by rewriting chunks, segments and IFDs. Strict parsers, bounded memory, no runtime dependencies.",
   "license": "MIT",
   "author": "patrickdk77",
   "main": "./dist/index.js",
@@ -15,6 +15,9 @@
       "require": "./dist/index.js"
     },
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "img-defuse": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -72,7 +75,10 @@
     "scan",
     "detect",
     "defuse",
-    "cdr"
+    "disarm",
+    "sanitize",
+    "cdr",
+    "cli"
   ],
   "devDependencies": {
     "@biomejs/biome": "^2.5.15",

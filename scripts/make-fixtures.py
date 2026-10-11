@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Rebuilds test/fixtures.
 
-clean/ holds images from Pillow, ImageMagick's convert, cjpeg, gifsicle and the libwebp tools.
+clean/ holds images from Pillow, ImageMagick's convert, cjpeg, gifsicle and the libwebp tools, and
+hand-built PSD, EMF and WMF files.
 meta/ holds images with metadata added by exiftool, Pillow and webpmux.
-quirks/ holds real tool output that a rewrite would change: ImageMagick's own GIF extension, and
-the stray TIFF header Pillow leaves between pages.
+quirks/ holds real tool output that a rewrite would change: ImageMagick's own GIF extension, the
+stray TIFF header Pillow leaves between pages, and Inkscape's private EMF comments and WMF escape.
 hostile/ holds files built byte by byte: bombs, bad checksums, truncation, trailing and hidden
 data, polyglots, loops, overlaps and huge dimensions.
-detect/ holds the signatures of formats this version recognizes but does not read.
+detect/ holds files of formats outside the package, which detection must not take for an image.
+rewrite/ holds files built byte by byte whose defused copy needs edits inside a structure: offsets,
+sequence numbers, sizes and flags written again.
 
-Run it with `python3 -I scripts/make-fixtures.py`. It needs Pillow, convert, cjpeg, gifsicle,
-cwebp, img2webp, gif2webp, webpmux and exiftool on the PATH.
+Run it with `python3 -I scripts/make-fixtures.py`. It needs Pillow with OpenJPEG and the brotli module,
+and convert, cjpeg, gifsicle, cwebp, img2webp, gif2webp, webpmux, exiftool and inkscape on the PATH.
+Naming groups, as in `python3 -I scripts/make-fixtures.py jpeg2000`, rebuilds only those, over the
+files already there. The groups are jpeg2000, jpegxl, photoshop and metafile.
 """
 
 import io
@@ -18,10 +23,12 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import zipfile
 import zlib
 
+import brotli
 from PIL import Image, ImageCms, PngImagePlugin
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -674,13 +681,6 @@ def quirks():
 def detect():
     write('detect/unknown.bin', b'This is plain text, not an image.\n')
     write('detect/svg.svg', b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>\n')
-    write('detect/jp2.jp2', b'\0\0\0\x0cjP  \r\n\x87\n' + bytes(20))
-    write('detect/j2k.j2k', b'\xff\x4f\xff\x51' + bytes(20))
-    write('detect/jxl.jxl', b'\xff\x0a' + bytes(20))
-    write('detect/jxl-box.jxl', b'\0\0\0\x0cJXL \r\n\x87\n' + bytes(20))
-    write('detect/psd.psd', b'8BPS\0\x01' + bytes(30))
-    write('detect/emf.emf', struct.pack('<II', 1, 108) + bytes(32) + b' EMF' + bytes(64))
-    write('detect/wmf.wmf', b'\xd7\xcd\xc6\x9a' + bytes(40))
     write('detect/heic.heic', struct.pack('>I', 24) + b'ftypheic' + bytes(12))
     write('detect/avif.avif', struct.pack('>I', 24) + b'ftypavif' + bytes(12))
 
@@ -843,8 +843,921 @@ def cases():
     color = bytes([0x40]) * (16 * 16 * 4)
     write('cases/ico-missing-and-mask.ico', ico([(16, 16, bmp_info(16, 32, 32) + color)], entries=[(16, 16, 6 + 16, 40 + len(color))]))
 
+    # 24. An EXIF block holding only an orientation of 6, which stripMetadata leaves as it is.
+    write('cases/jpeg-exif-orientation-only.jpg', after_soi(base_jpeg(), seg(0xE1, b'Exif\0\0' + exif_block(ifd0=[(0x0112, 3, 1, 6)]))))
+
+
+# ======================================================================
+# rewrite: files whose defused copy edits a structure, each built byte by byte
+
+
+def tiny_icc():
+    """The smallest ICC profile the inspector accepts: a 128-byte header with its size and signature, and no tags."""
+    head = struct.pack('>I', 132) + bytes(32) + b'acsp' + bytes(88)
+    return head + struct.pack('>I', 0)
+
+
+def tiff_blocks(blocks, order='<', big=False):
+    """Lays out a TIFF structure. `blocks` is a list of (name, item): bytes, or ('ifd', entries, next) where next names
+    the next IFD or is None. An entry is (tag, type, count, value). A value is a number, the name of a block (its
+    offset), a list of numbers and names, or bytes. A list or bytes longer than the value field goes right after the
+    IFD. The header points at the first block."""
+    head_size = 16 if big else 8
+    count_fmt, offset_fmt = ('Q', 'Q') if big else ('H', 'I')
+    entry_size = 20 if big else 12
+    field = 8 if big else 4
+    unit = {1: 1, 2: 1, 3: 2, 4: 4, 7: 1, 13: 4, 16: 8, 18: 8}
+
+    def raw(typ, value):
+        if isinstance(value, bytes):
+            return value
+        values = value if isinstance(value, list) else [value]
+        fmt = {1: 'B', 2: 'B', 3: 'H', 4: 'I', 7: 'B', 13: 'I', 16: 'Q', 18: 'Q'}[typ]
+        return b''.join(struct.pack(order + fmt, pos[v] if isinstance(v, str) else v) for v in values)
+
+    def ifd_size(entries):
+        size = struct.calcsize(order + count_fmt) + entry_size * len(entries) + struct.calcsize(order + offset_fmt)
+        for typ, value in ((e[1], e[3]) for e in entries):
+            n = len(value) if isinstance(value, bytes) else unit[typ] * (len(value) if isinstance(value, list) else 1)
+            if n > field:
+                size += n
+        return size
+
+    pos = {}
+    at = head_size
+    for name, item in blocks:
+        pos[name] = at
+        at += len(item) if isinstance(item, bytes) else ifd_size(item[1])
+    first = blocks[0][0]
+    out = bytearray((b'II' if order == '<' else b'MM') + struct.pack(order + 'H', 43 if big else 42))
+    out += struct.pack(order + 'HHQ', 8, 0, pos[first]) if big else struct.pack(order + 'I', pos[first])
+    for name, item in blocks:
+        assert len(out) == pos[name], name
+        if isinstance(item, bytes):
+            out += item
+            continue
+        _, entries, nxt = item
+        entries = sorted(entries, key=lambda e: e[0])
+        after = bytearray()
+        after_at = pos[name] + struct.calcsize(order + count_fmt) + entry_size * len(entries) + struct.calcsize(order + offset_fmt)
+        out += struct.pack(order + count_fmt, len(entries))
+        for tag, typ, count, value in entries:
+            data = raw(typ, value)
+            if len(data) > field:
+                out += struct.pack(order + ('HHQQ' if big else 'HHII'), tag, typ, count, after_at + len(after))
+                after += data
+            else:
+                out += struct.pack(order + ('HHQ' if big else 'HHI'), tag, typ, count) + data.ljust(field, b'\0')
+        out += struct.pack(order + offset_fmt, pos[nxt] if nxt else 0) + after
+    return bytes(out)
+
+
+def rewrite():
+    j = base_jpeg()
+    thumb = base_jpeg(8, 6)
+
+    # An APNG whose second frame has non-zero bytes after its zlib stream, filling a whole fdAT chunk. Dropping that
+    # chunk moves every later sequence number down by one.
+    w, h = 8, 8
+    stream = zlib.compress(gray_rows(w, h, 0x40))
+    write('rewrite/png-apng-stream-tail.png', png(
+        ihdr(w, h),
+        chunk(b'acTL', struct.pack('>II', 3, 0)),
+        fctl(0, w, h),
+        chunk(b'IDAT', zlib.compress(gray_rows(w, h))),
+        fctl(1, w, h),
+        chunk(b'fdAT', struct.pack('>I', 2) + stream),
+        chunk(b'fdAT', struct.pack('>I', 3) + b'TAILBYTES'),
+        fctl(4, w, h),
+        chunk(b'fdAT', struct.pack('>I', 5) + zlib.compress(gray_rows(w, h, 0x60))),
+    ))
+
+    # A PNG with an EXIF block holding a GPS IFD and a JPEG thumbnail, a text chunk and a color profile.
+    exif = exif_block(ifd0=[(0x0112, 3, 1, 1)], gps=GPS_ENTRIES, thumb=thumb)
+    write('rewrite/png-exif-thumbnail.png', gray_png(extra_before=[chunk(b'iCCP', b'icc\0\0' + zlib.compress(tiny_icc())), chunk(b'eXIf', exif)], extra_after=[chunk(b'tEXt', b'Comment\0kept unless stripped')]))
+
+    # A PNG where removing an unknown chunk brings a PDF header in a later text chunk into the first 1024 bytes.
+    write('rewrite/png-shifted-pdf.png', gray_png(extra_before=[chunk(b'prVt', bytes(range(256)) * 2 + bytes(188))], extra_after=[chunk(b'tEXt', b'Comment\0' + b'.' * 300 + b'%PDF-1.7\n')]))
+
+    # A JPEG with an MPF index naming two images after EOI, an image UID list, an attribute IFD after the index, and
+    # dependent image numbers.
+    second, third = base_jpeg(16, 12), base_jpeg(8, 6)
+    n = 3
+    payload_len = 4 + 240
+    primary_len = len(j) + 4 + payload_len
+    base = 2 + 4 + 4
+    uids = b''.join(bytes([0x30 + i]) * 32 + b'\0' for i in range(n))
+    entries = struct.pack('>IIIHH', 0x20030000, primary_len, 0, 2, 3)
+    entries += struct.pack('>IIIHH', 0x00020002, len(second), primary_len - base, 0, 0)
+    entries += struct.pack('>IIIHH', 0x00020002, len(third), primary_len + len(second) - base, 0, 0)
+    index = struct.pack('>H', 4) + struct.pack('>HHI4s', 0xB000, 7, 4, b'0100') + struct.pack('>HHII', 0xB001, 4, 1, n) + struct.pack('>HHII', 0xB002, 7, 16 * n, 62) + struct.pack('>HHII', 0xB003, 7, 33 * n, 110) + struct.pack('>I', 210)
+    attributes = struct.pack('>H', 2) + struct.pack('>HHI4s', 0xB000, 7, 4, b'0100') + struct.pack('>HHII', 0xB101, 4, 1, 1) + struct.pack('>I', 0)
+    tiff = b'MM\0*' + struct.pack('>I', 8) + index + entries + uids + b'\0' + attributes
+    assert len(tiff) == 240
+    write('rewrite/jpeg-mpf-two-images.jpg', after_soi(j, seg(0xE2, b'MPF\0' + tiff)) + second + third)
+
+    # A JPEG whose EXIF holds a camera name, an orientation of 6, an EXIF IFD, a GPS IFD and a JPEG thumbnail.
+    exif = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little')), (0x0112, 3, 1, 6)], exif=[(0x9000, 7, 4, int.from_bytes(b'0230', 'little'))], gps=GPS_ENTRIES, thumb=thumb)
+    write('rewrite/jpeg-exif-orientation-thumb.jpg', after_soi(j, seg(0xE1, b'Exif\0\0' + exif)))
+
+    # A JPEG with Photoshop resources: IPTC, a JPEG thumbnail, and a resource after the thumbnail.
+    header = struct.pack('>IIIIIIHH', 1, 8, 6, 24, 144, len(thumb), 24, 1)
+
+    def resource(rid, data):
+        r = b'8BIM' + struct.pack('>H', rid) + b'\0\0' + struct.pack('>I', len(data)) + data
+        return r + (b'\0' if len(data) % 2 else b'')
+
+    resources = resource(0x0404, b'\x1c\x02\x00\x00\x00') + resource(0x040C, header + thumb) + resource(0x0425, bytes(range(16)))
+    write('rewrite/jpeg-photoshop-thumbnail.jpg', after_soi(j, seg(0xED, b'Photoshop 3.0\0' + resources)))
+
+    # A JPEG with a JFIF header holding a 2 x 1 raw thumbnail, an ICC profile split over two APP2 segments, XMP,
+    # extended XMP in two segments, and a comment.
+    segs, rest = jpeg_segments(j)
+    # The segments after SOI, without Pillow's own JFIF header.
+    body = b''.join(s for m, s in segs if m != 0xE0) + rest
+    jfif = seg(0xE0, b'JFIF\0\x01\x01\0\0\x01\0\x01\x02\x01' + bytes(range(6)))
+    icc = tiny_icc()
+    icc1 = seg(0xE2, b'ICC_PROFILE\0\x01\x02' + icc[:66])
+    icc2 = seg(0xE2, b'ICC_PROFILE\0\x02\x02' + icc[66:])
+    xmp = seg(0xE1, b'http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x="adobe:ns:meta/"/>')
+    guid = b'0123456789ABCDEF0123456789ABCDEF'
+    ext = b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><!-- extended --></x:xmpmeta>'
+    ext1 = seg(0xE1, b'http://ns.adobe.com/xmp/extension/\0' + guid + struct.pack('>II', len(ext), 0) + ext[:30])
+    ext2 = seg(0xE1, b'http://ns.adobe.com/xmp/extension/\0' + guid + struct.pack('>II', len(ext), 30) + ext[30:])
+    com = seg(0xFE, b'a comment')
+    write('rewrite/jpeg-icc-xmp-thumbnail.jpg', b'\xff\xd8' + jfif + icc1 + icc2 + xmp + ext1 + ext2 + com + body)
+
+    # A GIF with a graphic control extension before a plain text extension, another before the image, bytes after
+    # the image's LZW end code, and a comment.
+    netscape = b'\x21\xff\x0bNETSCAPE2.0\x03\x01\0\0\0'
+
+    def control(delay):
+        return b'\x21\xf9\x04\x04' + struct.pack('<H', delay) + b'\0\0'
+
+    plain = b'\x21\x01\x0c' + bytes(12) + b'\x05hello\0'
+    g = gif(extensions=netscape + control(10) + plain + control(20), frames=[(0, 0, 4, 4, [i % 2 for i in range(16)], 2, (), b'TAIL', 0)])
+    write('rewrite/gif-control-plain-text.gif', g[:-1] + b'\x21\xfe' + sub_blocks(b'a comment') + b'\x3b')
+
+    # An extended WebP with an ICC profile, EXIF with a JPEG thumbnail, odd-sized XMP padded with a byte that is not
+    # zero, and an unknown chunk.
+    lossless = read('clean/webp/lossless.webp')
+    vp8l = webp_chunks(lossless)[0][1]
+    exif = exif_block(ifd0=[(0x0112, 3, 1, 1)], thumb=thumb)
+    write('rewrite/webp-extended-meta.webp', webp(vp8x(0x2C, 32, 24), riff_chunk(b'ICCP', tiny_icc()), riff_chunk(b'VP8L', vp8l), riff_chunk(b'EXIF', exif), riff_chunk(b'XMP ', b'<x:xmpmeta xmlns:x="adobe:ns:meta/"/>!', pad=b'P'), riff_chunk(b'ABCD', b'data')))
+
+    # An animated WebP whose first frame holds an unknown chunk after its image.
+    anmf = (0).to_bytes(3, 'little') * 2 + (31).to_bytes(3, 'little') + (23).to_bytes(3, 'little') + (100).to_bytes(3, 'little') + b'\0'
+    write('rewrite/webp-anim-inner-chunk.webp', webp(vp8x(0x02, 32, 24), riff_chunk(b'ANIM', bytes(6)), riff_chunk(b'ANMF', anmf + riff_chunk(b'VP8L', vp8l) + riff_chunk(b'ABCD', b'inner')), riff_chunk(b'ANMF', anmf + riff_chunk(b'VP8L', vp8l))))
+
+    # A TIFF with odd-length text values, an EXIF IFD, a GPS IFD, a private tag, bytes hidden between its parts, an
+    # uncompressed strip holding bytes past its rows, and trailing bytes.
+    strip0 = bytes(range(32)) + b'XTRA'
+    strip1 = bytes(range(32, 64))
+    write('rewrite/tiff-gaps-exif-gps.tif', tiff_blocks([
+        ('ifd0', ('ifd', [
+            (256, 3, 1, 8), (257, 3, 1, 8), (258, 3, 1, 8), (259, 3, 1, 1), (262, 3, 1, 1),
+            (270, 2, 13, b'a picture of\0'), (273, 4, 2, ['strip0', 'strip1']), (277, 3, 1, 1), (278, 3, 1, 4),
+            (279, 4, 2, [len(strip0), len(strip1)]), (305, 2, 5, b'tool\0'), (34665, 4, 1, 'exif'), (34853, 4, 1, 'gps'),
+            (37724, 7, 7, b'private'),
+        ], None)),
+        ('hidden', b'HIDE'),
+        ('exif', ('ifd', [(0x9000, 7, 4, b'0230')], None)),
+        ('gps', ('ifd', [(0, 1, 4, b'\x02\x03\0\0'), (1, 2, 2, b'N\0'), (2, 5, 3, bytes(24))], None)),
+        ('strip0', strip0),
+        ('strip1', strip1),
+        ('trailing', b'TRAILING'),
+    ]))
+
+    # A BigTIFF with a SubIFD holding a second image, and bytes hidden between the first IFD and its strip.
+    write('rewrite/tiff-big-subifd.tif', tiff_blocks([
+        ('ifd0', ('ifd', [(256, 3, 1, 4), (257, 3, 1, 4), (258, 3, 1, 8), (259, 3, 1, 1), (262, 3, 1, 1), (273, 16, 1, 'strip0'), (277, 3, 1, 1), (279, 16, 1, 16), (330, 18, 1, 'sub')], None)),
+        ('hidden', b'HIDDEN!!'),
+        ('strip0', bytes(range(16))),
+        ('sub', ('ifd', [(254, 4, 1, 1), (256, 3, 1, 2), (257, 3, 1, 2), (258, 3, 1, 8), (259, 3, 1, 1), (262, 3, 1, 1), (273, 16, 1, 'strip1'), (277, 3, 1, 1), (279, 16, 1, 4)], None)),
+        ('strip1', bytes([1, 2, 3, 4])),
+    ], big=True))
+
+    # A TIFF whose Photoshop resources hold IPTC and a JPEG thumbnail.
+    write('rewrite/tiff-photoshop-thumbnail.tif', tiff_blocks([
+        ('ifd0', ('ifd', [(256, 3, 1, 8), (257, 3, 1, 8), (258, 3, 1, 8), (259, 3, 1, 1), (262, 3, 1, 1), (273, 4, 1, 'strip'), (277, 3, 1, 1), (279, 4, 1, 64), (34377, 7, len(resources), resources)], None)),
+        ('strip', bytes(range(64))),
+    ]))
+
+    # A V5 BMP with an embedded color profile after the pixels, and bytes hidden between them.
+    pixels = bytes(16)
+    gap = b'GAPGAP'
+    profile = tiny_icc()
+    write('rewrite/bmp-v5-profile-gap.bmp', bmp_file(v5_info(2, 2, 0x4D424544, 124 + len(pixels) + len(gap), len(profile)), pixels=pixels + gap, profile=profile))
+
+    # An ICO with a PNG image holding a text chunk and bytes after its IEND, and a DIB image with bytes after its AND
+    # mask, each inside its own entry.
+    p16 = png(ihdr(16, 16), chunk(b'tEXt', b'Comment\0icon text'), chunk(b'IDAT', zlib.compress(gray_rows(16, 16)))) + b'AFTERIEND'
+    write('rewrite/ico-png-text-hidden.ico', ico([(16, 16, p16), (16, 16, dib_icon(16, 16) + b'AFTERMASK')]))
+
+
+# ======================================================================
+# JPEG 2000: clean files from Pillow's OpenJPEG, metadata from exiftool, and files built byte by byte
+
+
+UUID_XMP = bytes.fromhex('be7acfcb97a942e89c71999491e3afac')
+UUID_EXIF = b'JpgTiffExif->JP2'
+UUID_PHOTOSHOP = bytes.fromhex('2c4c0100850440b9a03e562148d6dfeb')
+UUID_GEOJP2 = bytes.fromhex('b14bf8bd083d4b43a5ae8cd7d5a6ce03')
+
+
+def box(kind, data):
+    return struct.pack('>I', 8 + len(data)) + kind + data
+
+
+def boxes_of(data):
+    """The boxes in data, as (type, content) pairs."""
+    out, p = [], 0
+    while p < len(data):
+        n, kind = struct.unpack('>I4s', data[p:p + 8])
+        n = n or len(data) - p
+        out.append((kind, data[p + 8:p + n]))
+        p += n
+    return out
+
+
+def join_boxes(boxes):
+    return b''.join(box(k, d) for k, d in boxes)
+
+
+def j2k_split(cs):
+    """A codestream as the segments of its main header after SOC, SIZ first, as (marker, payload) pairs, and the rest
+    from the first SOT."""
+    segs, p = [], 2
+    while struct.unpack('>H', cs[p:p + 2])[0] != 0xFF90:
+        m, n = struct.unpack('>HH', cs[p:p + 4])
+        segs.append((m, cs[p + 4:p + 2 + n]))
+        p += 2 + n
+    return segs, cs[p:]
+
+
+def j2k_join(segs, rest):
+    return b'\xff\x4f' + b''.join(struct.pack('>HH', m, len(d) + 2) + d for m, d in segs) + rest
+
+
+def j2k_parts(rest):
+    """The tile-parts of a codestream's body, each from its SOT, and what follows the last one."""
+    parts, p = [], 0
+    while struct.unpack('>H', rest[p:p + 2])[0] == 0xFF90:
+        psot = struct.unpack('>I', rest[p + 6:p + 10])[0]
+        parts.append(rest[p:p + psot])
+        p += psot
+    return parts, rest[p:]
+
+
+def siz_with(segs, **fields):
+    """The segments with SIZ's named 32-bit fields changed."""
+    names = ['xsiz', 'ysiz', 'xo', 'yo', 'xt', 'yt', 'xto', 'yto']
+    out = []
+    for m, d in segs:
+        if m == 0xFF51:
+            values = list(struct.unpack('>8I', d[2:34]))
+            for k, v in fields.items():
+                values[names.index(k)] = v
+            d = d[:2] + struct.pack('>8I', *values) + d[34:]
+        out.append((m, d))
+    return out
+
+
+def jpeg2000():
+    rgb = save(picture(), 'JPEG2000')
+    gray = save(picture(mode='L'), 'JPEG2000')
+    cs = save(picture(), 'JPEG2000', no_jp2=True)
+    tiled = save(picture(), 'JPEG2000', no_jp2=True, tile_size=(16, 16))
+    write('clean/jp2/rgb.jp2', rgb)
+    write('clean/jp2/gray.jp2', gray)
+    write('clean/jp2/rgba.jp2', save(picture(mode='RGBA'), 'JPEG2000'))
+    write('clean/jp2/tiled.jp2', save(picture(), 'JPEG2000', tile_size=(16, 16)))
+    write('clean/jp2/layers.jp2', save(picture(), 'JPEG2000', irreversible=True, quality_mode='rates', quality_layers=[40, 20, 10], plt=True))
+    write('clean/jp2/codestream.j2c', cs)
+    write('clean/jp2/tiled.j2c', tiled)
+
+    sig, ftyp, jp2h, jp2c = boxes_of(rgb)
+    ihdr_rgb = boxes_of(jp2h[1])[0][1]
+    srgb = box(b'colr', struct.pack('>BBBI', 1, 0, 0, 16))
+
+    def with_header(*inner, codestream=jp2c):
+        return join_boxes([sig, ftyp, (b'jp2h', box(b'ihdr', ihdr_rgb) + b''.join(inner)), codestream])
+
+    # A palette image: the gray codestream's one component indexes 256 RGB entries.
+    gsig, gftyp, gjp2h, gjp2c = boxes_of(gray)
+    ihdr_gray = boxes_of(gjp2h[1])[0][1]
+    pclr = struct.pack('>HB', 256, 3) + b'\x07\x07\x07' + b''.join(bytes((i, 255 - i, (i * 7) % 256)) for i in range(256))
+
+    def palette(columns):
+        cmap = b''.join(struct.pack('>HBB', 0, 1, c) for c in columns)
+        return join_boxes([gsig, gftyp, (b'jp2h', box(b'ihdr', ihdr_gray) + srgb + box(b'pclr', pclr) + box(b'cmap', cmap)), gjp2c])
+
+    write('clean/jp2/palette.jp2', palette([0, 1, 2]))
+
+    shutil.copy(path('clean/jp2/rgb.jp2'), tmp('meta.jp2'))
+    run('exiftool', '-q', '-overwrite_original', '-Make=FixtureCam', '-GPSLatitude=45.5', '-GPSLatitudeRef=N', '-XMP-dc:Title=Fixture', '-IPTC:Keywords=fixture', tmp('meta.jp2'))
+    shutil.copy(tmp('meta.jp2'), path('meta/jp2/exif-iptc-xmp.jp2'))
+    write('meta/jp2/icc.jp2', with_header(box(b'colr', b'\x02\0\0' + SRGB)))
+    write('meta/jp2/geojp2-xml.jp2', rgb + box(b'uuid', UUID_GEOJP2 + exif_block(ifd0=[(256, 3, 1, 1), (257, 3, 1, 1)])) + box(b'xml ', b'<gml:FeatureCollection xmlns:gml="http://www.opengis.net/gml"/>'))
+
+    write('hostile/jp2/trailing.jp2', rgb + b'TRAILING DATA')
+    write('hostile/jp2/hidden-after-eoc.jp2', join_boxes([sig, ftyp, jp2h, (b'jp2c', jp2c[1] + b'HIDDEN AFTER EOC')]))
+    write('hostile/jp2/zip-after-eoc.jp2', join_boxes([sig, ftyp, jp2h, (b'jp2c', jp2c[1] + tiny_zip())]))
+    write('hostile/jp2/pdf-in-xml.jp2', join_boxes([sig, ftyp, (b'xml ', b'<!-- %PDF-1.7 -->'), jp2h, jp2c]))
+    write('hostile/jp2/doctype-xmp.jp2', rgb + box(b'uuid', UUID_XMP + b'<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><x:xmpmeta xmlns:x="adobe:ns:meta/">&e;</x:xmpmeta>'))
+    write('hostile/jp2/size-mismatch.jp2', join_boxes([sig, ftyp, (b'jp2h', box(b'ihdr', struct.pack('>IIHBBBB', 24, 64, 3, 7, 7, 0, 0)) + srgb), jp2c]))
+    write('hostile/jp2/jpx-brand.jp2', join_boxes([sig, (b'ftyp', b'jpx \0\0\0\0jpx '), jp2h, jp2c]))
+    write('hostile/jp2/data-reference.jp2', rgb + box(b'dtbl', struct.pack('>H', 1) + box(b'url ', b'\0\0\0\0http://203.0.113.9/remote.j2c\0')))
+    write('hostile/jp2/bad-icc.jp2', with_header(box(b'colr', b'\x02\0\0not a profile')))
+    write('hostile/jp2/cmap-column.jp2', palette([0, 1, 5]))
+    write('hostile/jp2/second-codestream.jp2', rgb + box(b'jp2c', jp2c[1]))
+    write('hostile/jp2/no-header.jp2', join_boxes([sig, ftyp, jp2c]))
+
+    segs, rest = j2k_split(cs)
+    write('hostile/jp2/no-eoc.j2c', cs[:-2])
+    cod = [(m, d[:5] + b'\x21' + d[6:] if m == 0xFF52 else d) for m, d in segs]
+    write('hostile/jp2/levels.j2c', j2k_join(cod, rest))
+    write('hostile/jp2/huge.j2c', j2k_join(siz_with(segs, xsiz=100000, ysiz=100000, xt=100000, yt=100000), rest))
+    write('hostile/jp2/many-tiles.j2c', j2k_join(siz_with(segs, xsiz=512, ysiz=256, xt=1, yt=1), rest))
+    write('hostile/jp2/unknown-marker.j2c', j2k_join(segs + [(0xFF7F, b'private')], rest))
+
+    tsegs, trest = j2k_split(tiled)
+    parts, tail = j2k_parts(trest)
+    # Tile 0's tile-part numbered 1 where 0 must come first.
+    first = parts[0][:10] + b'\x01' + parts[0][11:]
+    write('hostile/jp2/tile-part-order.j2c', j2k_join(tsegs, first + b''.join(parts[1:]) + tail))
+
+    def tlm(lengths):
+        return b'\x00\x50' + b''.join(struct.pack('>BI', i, n) for i, n in enumerate(lengths))
+
+    wrong = [len(x) for x in parts]
+    wrong[2] += 1
+    write('hostile/jp2/tlm-wrong.j2c', j2k_join(tsegs + [(0xFF55, tlm(wrong))], trest))
+
+    # A tiled codestream with TLM and a comment in tile-part 1's header, which the rewrite takes out with stripMetadata.
+    text = b'A tile-part comment'
+    com = struct.pack('>HHH', 0xFF64, 4 + len(text), 1) + text
+    p1 = parts[1]
+    p1 = p1[:6] + struct.pack('>I', len(p1) + len(com)) + p1[10:12] + com + p1[12:]
+    with_com = [parts[0], p1] + parts[2:]
+    write('rewrite/jp2-tile-comment-tlm.j2c', j2k_join(tsegs + [(0xFF55, tlm([len(x) for x in with_com]))], b''.join(with_com) + tail))
+
+    # A JP2 with Photoshop resources (IPTC, a JPEG thumbnail, and a resource after it) and EXIF with GPS and a JPEG
+    # thumbnail, each in a UUID box.
+    thumb = base_jpeg(8, 6)
+
+    def resource(rid, data):
+        r = b'8BIM' + struct.pack('>H', rid) + b'\0\0' + struct.pack('>I', len(data)) + data
+        return r + (b'\0' if len(data) % 2 else b'')
+
+    resources = resource(0x0404, b'\x1c\x02\x00\x00\x00') + resource(0x040C, struct.pack('>IIIIIIHH', 1, 8, 6, 24, 144, len(thumb), 24, 1) + thumb) + resource(0x0425, bytes(range(16)))
+    exif = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little'))], gps=GPS_ENTRIES, thumb=thumb)
+    write('rewrite/jp2-photoshop-exif.jp2', join_boxes([sig, ftyp, jp2h, (b'uuid', UUID_PHOTOSHOP + resources), (b'uuid', UUID_EXIF + exif), jp2c]))
+    # A JP2 header holding a colour profile that does not parse, and a box JP2 does not define there.
+    write('rewrite/jp2-header-edits.jp2', with_header(box(b'colr', b'\x02\0\0' + tiny_icc()[:100]), box(b'priv', b'private data')))
+
+
+# ======================================================================
+# JPEG XL: codestream headers written bit by bit, since the inspector does not read frames, and metadata from exiftool
+
+
+JXL_SIG = b'\0\0\0\x0cJXL \r\n\x87\n'
+JXL_DIMENSION = [(9, 1), (13, 1), (18, 1), (30, 1)]
+
+
+def jxl_u32(b, distributions, value):
+    """Writes value with the first of four U32 distributions that holds it: a constant, or (bits, offset)."""
+    for selector, d in enumerate(distributions):
+        if isinstance(d, int):
+            if value == d:
+                b.put(selector, 2)
+                return
+        elif d[1] <= value < d[1] + (1 << d[0]):
+            b.put(selector, 2)
+            b.put(value - d[1], d[0])
+            return
+    raise ValueError(value)
+
+
+def jxl_codestream(w, h, bits=8, extra=0, animation=False, tail=bytes(range(32))):
+    """A JPEG XL codestream's signature, size header and image header up to its count of extra channels, then `tail`
+    where the rest of the header and the frames would be."""
+    b = Vp8lBits()
+    small = w % 8 == 0 and h % 8 == 0 and w <= 256 and h <= 256
+    b.put(small, 1)
+    if small:
+        b.put(h // 8 - 1, 5)
+    else:
+        jxl_u32(b, JXL_DIMENSION, h)
+    b.put(0, 3)  # no fixed aspect ratio, so the width follows
+    if small:
+        b.put(w // 8 - 1, 5)
+    else:
+        jxl_u32(b, JXL_DIMENSION, w)
+    if bits == 8 and extra == 0 and not animation:
+        b.put(1, 1)  # all_default
+    else:
+        b.put(0, 1)
+        b.put(1 if animation else 0, 1)  # extra_fields
+        if animation:
+            b.put(0, 3)  # orientation 1
+            b.put(0, 1)  # no intrinsic size
+            b.put(0, 1)  # no preview
+            b.put(1, 1)  # animation: 100 ticks a second, looping forever, no timecodes
+            jxl_u32(b, [100, 1000, (10, 1), (30, 1)], 100)
+            jxl_u32(b, [1, 1001, (8, 1), (10, 1)], 1)
+            jxl_u32(b, [0, (3, 0), (16, 0), (32, 0)], 0)
+            b.put(0, 1)
+        b.put(0, 1)  # integer samples
+        jxl_u32(b, [8, 10, 12, (6, 1)], bits)
+        b.put(1, 1)  # 16-bit buffers suffice
+        jxl_u32(b, [0, 1, (4, 2), (12, 1)], extra)
+    return b'\xff\x0a' + b.bytes() + tail
+
+
+def jxl_file(*boxes):
+    return JXL_SIG + box(b'ftyp', b'jxl \0\0\0\0jxl ') + b''.join(boxes)
+
+
+def jpegxl():
+    small = jxl_codestream(64, 48)
+    write('clean/jxl/bare.jxl', small)
+    write('clean/jxl/bare-animated.jxl', jxl_codestream(150, 100, bits=16, extra=1, animation=True))
+    write('clean/jxl/container.jxl', jxl_file(box(b'jxll', b'\x05'), box(b'jxlc', small)))
+    write('clean/jxl/partial.jxl', jxl_file(box(b'jxlp', struct.pack('>I', 0) + small[:3]), box(b'jxlp', struct.pack('>I', 0x80000001) + small[3:])))
+    container = read('clean/jxl/container.jxl')
+
+    shutil.copy(path('clean/jxl/container.jxl'), tmp('meta.jxl'))
+    run('exiftool', '-q', '-overwrite_original', '-Make=FixtureCam', '-GPSLatitude=45.5', '-GPSLatitudeRef=N', '-XMP-dc:Title=Fixture', tmp('meta.jxl'))
+    shutil.copy(tmp('meta.jxl'), path('meta/jxl/exif-xmp.jxl'))
+    shutil.copy(path('clean/jxl/container.jxl'), tmp('brob.jxl'))
+    run('exiftool', '-q', '-overwrite_original', '-api', 'Compress=1', '-Make=FixtureCam', '-GPSLatitude=45.5', '-GPSLatitudeRef=N', '-XMP-dc:Title=Fixture', tmp('brob.jxl'))
+    shutil.copy(tmp('brob.jxl'), path('meta/jxl/brotli.jxl'))
+    write('meta/jxl/jumbf.jxl', container + box(b'jumb', box(b'jumd', bytes(16) + b'\x03c2pa\0')))
+
+    thumb = base_jpeg(8, 6)
+    write('hostile/jxl/trailing.jxl', container + b'TRAILING DATA')
+    write('hostile/jxl/zip-trailing.jxl', container + tiny_zip())
+    write('hostile/jxl/jbrd.jxl', container + box(b'jbrd', bytes(range(64))))
+    write('hostile/jxl/doctype-xmp.jxl', container + box(b'xml ', b'<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><x:xmpmeta xmlns:x="adobe:ns:meta/">&e;</x:xmpmeta>'))
+    exif_thumb = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little'))], thumb=thumb)
+    write('hostile/jxl/brotli-thumbnail.jxl', container + box(b'brob', b'Exif' + brotli.compress(struct.pack('>I', 0) + exif_thumb)))
+    write('hostile/jxl/brotli-bomb.jxl', container + box(b'brob', b'xml ' + brotli.compress(b' ' * (9 << 20))))
+    write('hostile/jxl/brotli-corrupt.jxl', container + box(b'brob', b'xml not Brotli data'))
+    write('hostile/jxl/huge.jxl', jxl_codestream(65536, 65536))
+    write('hostile/jxl/deep-samples.jxl', jxl_codestream(64, 48, bits=40))
+    write('hostile/jxl/cut-header.jxl', b'\xff\x0a\x00')
+    write('hostile/jxl/jxlp-order.jxl', jxl_file(box(b'jxlp', struct.pack('>I', 1) + small[:3]), box(b'jxlp', struct.pack('>I', 0x80000000) + small[3:])))
+    write('hostile/jxl/jxlp-unfinished.jxl', jxl_file(box(b'jxlp', struct.pack('>I', 0) + small)))
+    write('hostile/jxl/jxlc-and-jxlp.jxl', jxl_file(box(b'jxlc', small), box(b'jxlp', struct.pack('>I', 0x80000000) + small)))
+    write('hostile/jxl/no-codestream.jxl', jxl_file(box(b'xml ', b'<x/>')))
+
+    # A gain map: version 0, no metadata, colour encoding or ICC profile, then a bare codestream.
+    write('rewrite/jxl-gain-map.jxl', container + box(b'jhgm', b'\0' + struct.pack('>H', 0) + b'\0' + struct.pack('>I', 0) + jxl_codestream(32, 24)))
+    # EXIF with a camera name, a GPS IFD and a JPEG thumbnail.
+    exif = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little'))], gps=GPS_ENTRIES, thumb=thumb)
+    write('rewrite/jxl-exif-thumbnail.jxl', container + box(b'Exif', struct.pack('>I', 0) + exif))
+
+
+
+# ======================================================================
+# photoshop: PSD and PSB (Adobe Photoshop File Format)
+
+
+def packbits(row):
+    """PackBits as Photoshop writes RLE rows: literal runs of up to 128 bytes."""
+    out = bytearray()
+    for i in range(0, len(row), 128):
+        piece = row[i:i + 128]
+        out += bytes([len(piece) - 1]) + piece
+    return bytes(out)
+
+
+def psd_header(w, h, channels=3, depth=8, mode=3, version=1, reserved=bytes(6)):
+    return b'8BPS' + struct.pack('>H', version) + reserved + struct.pack('>HIIHH', channels, h, w, depth, mode)
+
+
+def psd_resource(rid, data, sig=b'8BIM'):
+    """An image resource block with an empty name."""
+    return sig + struct.pack('>H', rid) + b'\0\0' + struct.pack('>I', len(data)) + data + (b'\0' if len(data) % 2 else b'')
+
+
+def psd_tagged(key, data, length_size=4, sig=b'8BIM'):
+    return sig + key + struct.pack('>Q' if length_size == 8 else '>I', len(data)) + data
+
+
+def psd_unicode(text):
+    """A Photoshop Unicode string: a count of UTF-16 units, the trailing NUL included, then the units."""
+    return struct.pack('>I', len(text) + 1) + text.encode('utf-16-be') + b'\0\0'
+
+
+def psd_key(k):
+    return struct.pack('>I', 0) + k if len(k) == 4 else struct.pack('>I', len(k)) + k
+
+
+def psd_descriptor(items, cls=b'null'):
+    """A descriptor: a name, a class ID, then (key, type, value) items."""
+    return psd_unicode('') + psd_key(cls) + struct.pack('>I', len(items)) + b''.join(psd_key(k) + t + v for k, t, v in items)
+
+
+def psd_descriptor_block(items):
+    return struct.pack('>I', 16) + psd_descriptor(items)
+
+
+def psd_layer(rect, channels, name=b'Layer', blocks=b'', mask=b'', big=False):
+    """A layer record: its rectangle, (channel id, data length) pairs, blend mode, and the extra data."""
+    top, left, bottom, right = rect
+    r = struct.pack('>iiiiH', top, left, bottom, right, len(channels))
+    for cid, n in channels:
+        r += struct.pack('>h', cid) + struct.pack('>Q' if big else '>I', n)
+    r += b'8BIMnorm' + bytes([255, 0, 8, 0])
+    pascal = bytes([len(name)]) + name
+    pascal += bytes(-len(pascal) % 4)
+    extra = struct.pack('>I', len(mask)) + mask + struct.pack('>I', 0) + pascal + blocks
+    return r + struct.pack('>I', len(extra)) + extra
+
+
+def psd_channel(w, h, value, compression=0):
+    """One layer channel's image data: its compression code and the rows."""
+    rows = [bytes([value]) * w for _ in range(h)]
+    if compression == 1:
+        packed = [packbits(row) for row in rows]
+        return struct.pack('>H', 1) + b''.join(struct.pack('>H', len(x)) for x in packed) + b''.join(packed)
+    return struct.pack('>H', 0) + b''.join(rows)
+
+
+def psd_layer_info(layers, count=None):
+    """Layer info: a count, the records, then each layer's channel data, padded to an even length. `layers` holds
+    (record arguments, channel data list) pairs; the records get their channel lengths from the data."""
+    records = b''
+    data = b''
+    for args, channels in layers:
+        rect, ids = args['rect'], args['ids']
+        records += psd_layer(rect, list(zip(ids, [len(c) for c in channels])), **{k: v for k, v in args.items() if k not in ('rect', 'ids')})
+        data += b''.join(channels)
+    body = struct.pack('>h', len(layers) if count is None else count) + records + data
+    return body + bytes(len(body) % 2)
+
+
+def psd_file(w, h, planes, channels=3, depth=8, mode=3, resources=b'', layer_info=None, blocks=b'', colour=b'', compression=1,
+             big=False, version=None, reserved=bytes(6), after=b'', global_mask=True):
+    """A Photoshop document. `planes` is the composite's planar data, which goes in raw, RLE or ZIP."""
+    out = psd_header(w, h, channels, depth, mode, version or (2 if big else 1), reserved)
+    out += struct.pack('>I', len(colour)) + colour
+    out += struct.pack('>I', len(resources)) + resources
+    lm = b''
+    if layer_info is not None or blocks:
+        li = layer_info or b''
+        lm = (struct.pack('>Q' if big else '>I', len(li)) + li) + (struct.pack('>I', 0) if global_mask else b'') + blocks
+    out += struct.pack('>Q' if big else '>I', len(lm)) + lm
+    row = (w * depth + 7) // 8
+    if compression == 0:
+        out += struct.pack('>H', 0) + planes
+    elif compression == 1:
+        rows = [packbits(planes[i:i + row]) for i in range(0, len(planes), row)]
+        out += struct.pack('>H', 1) + b''.join(struct.pack('>I' if big else '>H', len(x)) for x in rows) + b''.join(rows)
+    else:
+        out += struct.pack('>H', compression) + zlib.compress(planes)
+    return out + after
+
+
+def psd_planes(w, h, channels=3):
+    return b''.join(bytes(((x * 8 + y * 3 + c * 50) & 0xFF) for y in range(h) for x in range(w)) for c in range(channels))
+
+
+def psd_linked(kind, version, name, ftype, data=b'', open_items=None, file_items=None):
+    """An item of a linked layer block, with its length and its padding to four bytes."""
+    body = kind + struct.pack('>I', version) + bytes([4]) + b'uid1' + psd_unicode(name) + ftype + b'8BIM' + struct.pack('>Q', len(data))
+    body += (b'\x01' + psd_descriptor_block(open_items)) if open_items is not None else b'\x00'
+    if kind == b'liFE':
+        body += psd_descriptor_block(file_items or [])
+        if version > 3:
+            body += struct.pack('>IBBBBd', 2026, 10, 11, 12, 0, 0.0)
+        body += struct.pack('>Q', len(data))
+        if version > 2:
+            body += data
+    elif kind == b'liFA':
+        body += bytes(8)
+    else:
+        body += data
+    if version >= 5:
+        body += psd_unicode('child')
+    if version >= 6:
+        body += struct.pack('>d', 0.0)
+    if version >= 7:
+        body += b'\0'
+    return struct.pack('>Q', len(body)) + body + bytes(-len(body) % 4)
+
+
+def photoshop():
+    picture().save(tmp('src.png'))
+    picture(mode='RGBA').save(tmp('alpha.png'))
+    run('convert', tmp('src.png'), path('clean/psd/flat.psd'))
+    run('convert', tmp('src.png'), tmp('src.png'), tmp('alpha.png'), path('clean/psd/layers.psd'))
+    run('convert', tmp('src.png'), '-colorspace', 'gray', path('clean/psd/gray.psd'))
+    run('convert', tmp('src.png'), '-colors', '16', '-type', 'Palette', path('clean/psd/palette.psd'))
+    run('convert', tmp('src.png'), '-colorspace', 'CMYK', path('clean/psd/cmyk.psd'))
+    run('convert', tmp('src.png'), '-depth', '16', path('clean/psd/depth16.psd'))
+    run('convert', tmp('src.png'), 'PSB:' + path('clean/psd/flat.psb'))
+    planes = psd_planes(32, 24)
+    write('clean/psd/raw.psd', psd_file(32, 24, planes, compression=0))
+    write('clean/psd/zip.psd', psd_file(32, 24, planes, compression=2))
+    # Two layers with RLE and raw channels, one of them off the canvas, and a negative count for merged transparency.
+    layers = psd_layer_info([
+        ({'rect': (0, 0, 24, 32), 'ids': [-1, 0, 1, 2], 'blocks': psd_tagged(b'luni', psd_unicode('Back'))},
+         [psd_channel(32, 24, 255, 1), psd_channel(32, 24, 10, 1), psd_channel(32, 24, 20, 1), psd_channel(32, 24, 30, 1)]),
+        ({'rect': (-4, -4, 8, 12), 'ids': [0, 1, 2], 'name': b'Offset'}, [psd_channel(16, 12, 40), psd_channel(16, 12, 50), psd_channel(16, 12, 60)]),
+    ], count=-2)
+    write('clean/psd/hand-layers.psd', psd_file(32, 24, planes, layer_info=layers, blocks=psd_tagged(b'Patt', b'')))
+    # 16-bit layers go in an Lr16 block, and the section's own layer info is empty.
+    lr16 = psd_layer_info([({'rect': (0, 0, 2, 2), 'ids': [0, 1, 2]}, [psd_channel(4, 2, 7)] * 3)])
+    write('clean/psd/lr16.psd', psd_file(32, 24, psd_planes(64, 24), depth=16, layer_info=b'', blocks=psd_tagged(b'Lr16', lr16), compression=0))
+
+    flat = read('clean/psd/flat.psd')
+    shutil.copy(path('clean/psd/flat.psd'), tmp('meta.psd'))
+    run('exiftool', '-q', '-overwrite_original', '-Make=FixtureCam', '-GPSLatitude=45.5', '-GPSLatitudeRef=N', '-XMP-dc:Title=Fixture', '-IPTC:Keywords=fixture',
+        tmp('meta.psd'))
+    shutil.copy(tmp('meta.psd'), path('meta/psd/exif-iptc-xmp.psd'))
+    thumb = base_jpeg(8, 6)
+    thumb_resource = struct.pack('>IIIIIIHH', 1, 8, 6, 24, 144, len(thumb), 24, 1) + thumb
+    write('meta/psd/resources.psd', psd_file(32, 24, planes, resources=b''.join([
+        psd_resource(0x03ED, struct.pack('>IHHIHH', 72 << 16, 1, 1, 72 << 16, 1, 1)),
+        psd_resource(0x040F, tiny_icc()),
+        psd_resource(0x03F0, b'\x07Caption'),
+        psd_resource(0x041E, struct.pack('>I', 1) + struct.pack('>II', 0, 1) + psd_unicode('http://203.0.113.9/')),
+        psd_resource(0x041A, struct.pack('>I', 6) + bytes(16) + psd_unicode('slices') + struct.pack('>I', 0)),
+    ])))
+    write('meta/psd/annotations.psd', psd_file(32, 24, planes, layer_info=b'', blocks=psd_tagged(b'Anno', struct.pack('>HHI', 2, 1, 0))))
+
+    write('hostile/psd/trailing.psd', flat + b'<html><script>alert(1)</script></html>')
+    write('hostile/psd/zip-trailing.psd', flat + tiny_zip())
+    write('hostile/psd/version.psd', psd_file(32, 24, planes, version=3))
+    write('hostile/psd/reserved.psd', psd_file(32, 24, planes, reserved=b'HIDDEN'))
+    write('hostile/psd/channels.psd', psd_file(32, 24, b'', channels=57))
+    write('hostile/psd/huge.psd', psd_header(30000, 30000) + bytes(14))
+    write('hostile/psd/indexed-no-palette.psd', psd_file(32, 24, psd_planes(32, 24, 1), channels=1, mode=2))
+    write('hostile/psd/negative-rectangle.psd', psd_file(32, 24, planes, layer_info=psd_layer_info([({'rect': (10, 0, 2, 4), 'ids': [0]}, [psd_channel(4, 1, 0)])])))
+    write('hostile/psd/channel-compression.psd', psd_file(32, 24, planes, layer_info=psd_layer_info([({'rect': (0, 0, 1, 1), 'ids': [0]}, [struct.pack('>H', 7) + b'\0'])])))
+    long_channel = psd_layer_info([({'rect': (0, 0, 1, 1), 'ids': [0]}, [psd_channel(1, 1, 0)])])
+    long_channel = long_channel.replace(struct.pack('>hI', 0, 3), struct.pack('>hI', 0, 3000), 1)
+    write('hostile/psd/channel-length.psd', psd_file(32, 24, planes, layer_info=long_channel))
+    write('hostile/psd/huge-layer.psd', psd_file(32, 24, planes, layer_info=psd_layer_info([({'rect': (0, 0, 70000, 70000), 'ids': [0]}, [b''])])))
+    write('hostile/psd/zip-bomb.psd', psd_header(32, 24) + bytes(12) + struct.pack('>H', 2) + zlib.compress(bytes(10_000_000), 9))
+    write('hostile/psd/rle-short.psd', psd_file(32, 24, planes)[:-40])
+    write('hostile/psd/unknown-block.psd', psd_file(32, 24, planes, layer_info=b'', blocks=psd_tagged(b'zzzz', b'private data')))
+    hidden = psd_layer_info([({'rect': (0, 0, 1, 1), 'ids': [0]}, [psd_channel(1, 1, 0)])]) + b'HIDDEN'
+    write('hostile/psd/hidden-layer-info.psd', psd_file(32, 24, planes, layer_info=hidden))
+    write('hostile/psd/doctype-xmp.psd', psd_file(32, 24, planes, resources=psd_resource(0x0424, b'<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><x:xmpmeta xmlns:x="adobe:ns:meta/">&e;</x:xmpmeta>')))
+    write('hostile/psd/bad-icc.psd', psd_file(32, 24, planes, resources=psd_resource(0x040F, b'not a profile')))
+    write('hostile/psd/pdf-in-caption.psd', psd_file(32, 24, planes, resources=psd_resource(0x03F0, b'\x20%PDF-1.7 1 0 obj << >> endobj')))
+
+    # Linked files: an embedded PNG, a link to a file outside, and an alias, with descriptors of the types Photoshop
+    # writes; and a block whose descriptor holds a type no reader defines.
+    png_file = save(picture(8, 6), 'PNG')
+    open_items = [(b'compInfo', b'Objc', psd_descriptor([(b'compID', b'long', struct.pack('>i', -1)), (b'originalCompID', b'long', struct.pack('>i', -1))])),
+                  (b'Wdth', b'UntF', b'#Pxl' + struct.pack('>d', 8.0)), (b'Rslt', b'doub', struct.pack('>d', 72.0)), (b'Lyrs', b'bool', b'\x01'),
+                  (b'Nm  ', b'TEXT', psd_unicode('open')), (b'Md  ', b'enum', psd_key(b'Md  ') + psd_key(b'RGBC')),
+                  (b'list', b'VlLs', struct.pack('>I', 2) + b'long' + struct.pack('>i', 1) + b'TEXT' + psd_unicode('x')),
+                  (b'raw ', b'tdta', struct.pack('>I', 3) + b'abc'), (b'big ', b'comp', struct.pack('>q', 1)),
+                  (b'ref ', b'obj ', struct.pack('>I', 1) + b'Enmr' + psd_unicode('') + psd_key(b'Lyr ') + psd_key(b'Ordn') + psd_key(b'Trgt'))]
+    file_items = [(b'fullPath', b'TEXT', psd_unicode('/Users/someone/linked.png')), (b'relPath', b'TEXT', psd_unicode('linked.png'))]
+    items = (psd_linked(b'liFD', 7, 'embedded.png', b'PNG ', png_file, open_items=open_items)
+             + psd_linked(b'liFE', 7, 'linked.png', b'PNG ', b'', file_items=file_items)
+             + psd_linked(b'liFA', 2, 'alias.png', b'PNG ', b''))
+    write('rewrite/psd-linked.psd', psd_file(32, 24, planes, layer_info=b'', blocks=psd_tagged(b'lnk2', items) + psd_tagged(b'Patt', b'')))
+    odd = psd_linked(b'liFD', 3, 'embedded.png', b'PNG ', png_file, open_items=[(b'odd ', b'XXXX', b'')])
+    write('hostile/psd/linked-unknown-type.psd', psd_file(32, 24, planes, layer_info=b'', blocks=psd_tagged(b'lnk2', odd)))
+    write('rewrite/psd-thumbnail.psd', psd_file(32, 24, planes, resources=psd_resource(0x040C, thumb_resource)))
+    # EXIF with a JPEG thumbnail, which goes to the plugins, and EXIF whose thumbnail pointer has 0 bytes, as Photoshop
+    # writes it.
+    exif = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little'))], thumb=thumb)
+    write('hostile/psd/exif-thumbnail.psd', psd_file(32, 24, planes, resources=psd_resource(0x03ED, bytes(16)) + psd_resource(0x0422, exif)))
+    empty = exif_block(ifd0=[(0x010F, 2, 4, int.from_bytes(b'Cam\0', 'little'))], thumb=b'')
+    write('hostile/psd/exif-empty-thumbnail.psd', psd_file(32, 24, planes, resources=psd_resource(0x03ED, bytes(16)) + psd_resource(0x0422, empty)))
+
+
+
+# ======================================================================
+# metafile: EMF with EMF+ ([MS-EMF], [MS-EMFPLUS]) and WMF ([MS-WMF]), built record by record
+
+
+def emr(kind, payload):
+    """An EMF record: its type, its size padded to four bytes, and its parameters."""
+    size = 8 + len(payload)
+    pad = -size % 4
+    return struct.pack('<II', kind, size + pad) + payload + bytes(pad)
+
+
+def emf_header(frame=(0, 0, 1693, 1270), description=None, records=0, total=0, size=108):
+    """EMR_HEADER with both extensions: a 64 x 48 picture at 96 pixels an inch, and an optional description."""
+    desc = description.encode('utf-16-le') if description is not None else b''
+    off = size if desc else 0
+    body = struct.pack('<4i4i', 0, 0, 63, 47, *frame) + b' EMF' + struct.pack('<IIIHHIII', 0x10000, total, records, 1, 0, len(desc) // 2, off, 0)
+    body += struct.pack('<4i', 1920, 1080, 508, 286) + struct.pack('<III', 0, 0, 0) + struct.pack('<II', 508000, 285750)
+    rec = struct.pack('<II', 1, 0) + body
+    rec = rec[:size] + desc
+    rec += bytes(-len(rec) % 4)
+    return rec[:4] + struct.pack('<I', len(rec)) + rec[8:]
+
+
+EMF_EOF = emr(0x0E, struct.pack('<III', 0, 16, 20))
+
+
+def emf_file(records, description=None, nbytes=None, nrecords=None, after=b'', eof=EMF_EOF):
+    """An EMF of the records given between its header and EMR_EOF, with the header's byte and record counts."""
+    body = b''.join(records) + eof
+    head = emf_header(description=description)
+    total = len(head) + len(body)
+    head = emf_header(description=description, records=len(records) + 2 if nrecords is None else nrecords, total=total if nbytes is None else nbytes)
+    return head + body + after
+
+
+def emr_rectangle(l=4, t=4, r=40, b=30):
+    return emr(0x2B, struct.pack('<4i', l, t, r, b))
+
+
+def dib(w, h, bpp=24, compression=0, bits=None, colors=b''):
+    """A BITMAPINFOHEADER, a color table and bits; uncompressed bits fill every row when not given."""
+    stride = (w * bpp + 31) // 32 * 4
+    data = bits if bits is not None else bytes(((x * 7) & 0xFF) for x in range(stride * h))
+    head = struct.pack('<IiiHHIIiiII', 40, w, h, 1, bpp, compression, len(data), 2835, 2835, len(colors) // 4, 0)
+    return head + colors, data
+
+
+def emr_stretchdibits(w, h, bpp=24, compression=0, bits=None, colors=b''):
+    head, data = dib(w, h, bpp, compression, bits, colors)
+    fixed = struct.pack('<4i', 0, 0, w - 1, h - 1) + struct.pack('<6i', 0, 0, 0, 0, w, h)
+    fixed += struct.pack('<IIII', 80, len(head), 80 + len(head), len(data)) + struct.pack('<IIii', 0, 0x00CC0020, w, h)
+    return emr(0x51, fixed + head + data)
+
+
+def emf_plus(*records):
+    """An EMR_COMMENT holding EMF+ records."""
+    data = b'EMF+' + b''.join(records)
+    return emr(0x46, struct.pack('<I', len(data)) + data)
+
+
+def emfp(kind, flags, data):
+    pad = -len(data) % 4
+    return struct.pack('<HHII', kind, flags, 12 + len(data) + pad, len(data) + pad) + data + bytes(pad)
+
+
+EMFP_HEADER = emfp(0x4001, 1, struct.pack('<IIII', 0xDBC01002, 1, 96, 96))
+EMFP_EOF = emfp(0x4002, 0, b'')
+
+
+def emfp_image(object_id, file, metafile_type=None):
+    """An EmfPlusObject holding an image: a compressed bitmap, or a metafile of the type given."""
+    if metafile_type is None:
+        payload = struct.pack('<II', 0xDBC01002, 1) + struct.pack('<iiiII', 0, 0, 0, 0, 1) + file
+    else:
+        payload = struct.pack('<II', 0xDBC01002, 2) + struct.pack('<II', metafile_type, len(file)) + file
+    return payload
+
+
+def emfp_continued(object_id, payload, part):
+    """The payload of an image object split into continued EmfPlusObject records of `part` bytes."""
+    out = []
+    for at in range(0, len(payload), part):
+        piece = payload[at:at + part]
+        out.append(emfp(0x4008, 0x8000 | (5 << 8) | object_id, struct.pack('<I', len(payload)) + piece))
+    return out
+
+
+def emr_comment_public(kind, data):
+    body = b'GDIC' + struct.pack('<I', kind) + data
+    return emr(0x46, struct.pack('<I', len(body)) + body)
+
+
+def wmr(fn, params=b''):
+    """A WMF record: its size in words, its function, and its parameters."""
+    params += bytes(len(params) % 2)
+    return struct.pack('<IH', 3 + len(params) // 2, fn) + params
+
+
+def wmf_file(records, objects=1, placeable=True, size=None, largest=None, after=b'', eof=None, checksum=None, key=0x9AC6CDD7):
+    body = b''.join(records) + (eof if eof is not None else wmr(0))
+    sizes = []
+    p = 0
+    while p < len(body):
+        n = struct.unpack_from('<I', body, p)[0]
+        sizes.append(n)
+        p += n * 2
+    words = (18 + len(body)) // 2
+    head = struct.pack('<HHHIHIH', 1, 9, 0x300, words if size is None else size, objects, max(sizes) if largest is None else largest, 0)
+    out = head + body + after
+    if placeable:
+        pl = struct.pack('<IH4hHI', key, 0, 0, 0, 64, 48, 96, 0)
+        sum_ = 0
+        for i in range(10):
+            sum_ ^= struct.unpack_from('<H', pl, i * 2)[0]
+        out = pl + struct.pack('<H', sum_ if checksum is None else checksum) + out
+    return out
+
+
+WMF_DRAW = [wmr(0x020B, struct.pack('<hh', 0, 0)), wmr(0x020C, struct.pack('<hh', 48, 64)), wmr(0x02FC, struct.pack('<HIH', 0, 0x00336699, 0)),
+            wmr(0x012D, struct.pack('<H', 0)), wmr(0x041B, struct.pack('<4h', 30, 40, 4, 4)), wmr(0x01F0, struct.pack('<H', 0))]
+
+
+def wmr_stretchdib(w, h, bpp=24, compression=0, bits=None, colors=b''):
+    head, data = dib(w, h, bpp, compression, bits, colors)
+    return wmr(0x0F43, struct.pack('<IH8h', 0x00CC0020, 0, h, w, 0, 0, h, w, 0, 0) + head + data)
+
+
+def wmr_bitblt16(w, h, bpp=1, short=0):
+    stride = ((w * bpp + 15) >> 4) << 1
+    bits = bytes(stride * h - short)
+    return wmr(0x0922, struct.pack('<I6h', 0x00CC0020, 0, 0, h, w, 0, 0) + struct.pack('<hhhhBB', 0, w, h, stride, 1, bpp) + bits)
+
+
+def metafile():
+    # Real tool output, which a rewrite changes: Inkscape writes private comments into EMF and an escape into WMF.
+    with open(tmp('d.svg'), 'w') as f:
+        f.write('<svg xmlns="http://www.w3.org/2000/svg" width="64" height="48"><rect x="4" y="4" width="40" height="30" fill="#3a6"/>'
+                '<circle cx="40" cy="30" r="12" fill="#c33"/></svg>')
+    run('inkscape', '--export-type=emf', '--export-filename=' + path('quirks/inkscape.emf'), tmp('d.svg'))
+    run('inkscape', '--export-type=wmf', '--export-filename=' + path('quirks/inkscape.wmf'), tmp('d.svg'))
+
+    png_file = save(picture(8, 6), 'PNG')
+    write('clean/emf/rectangle.emf', emf_file([emr_rectangle()]))
+    write('clean/emf/description.emf', emf_file([emr_rectangle()], description='Fixture\0Picture\0\0'))
+    write('clean/emf/dib.emf', emf_file([emr_stretchdibits(8, 6)]))
+    rle = bytes([4, 1, 4, 2, 0, 0]) * 6 + bytes([0, 1])
+    write('clean/emf/dib-rle8.emf', emf_file([emr_stretchdibits(8, 6, bpp=8, compression=1, bits=rle, colors=bytes(range(16)))]))
+    write('clean/emf/groups.emf', emf_file([emr_comment_public(2, struct.pack('<4iI', 0, 0, 63, 47, 0)), emr_rectangle(), emr_comment_public(3, b'')]))
+    fill = emfp(0x400A, 0x8000, struct.pack('<II', 0xFF336699, 1) + struct.pack('<4f', 4, 4, 36, 26))
+    write('clean/emf/emfplus.emf', emf_file([emf_plus(EMFP_HEADER, fill), emr_rectangle(), emf_plus(EMFP_EOF)]))
+    write('clean/wmf/rectangle.wmf', wmf_file(WMF_DRAW))
+    write('clean/wmf/plain.wmf', wmf_file(WMF_DRAW, placeable=False))
+    write('clean/wmf/dib.wmf', wmf_file(WMF_DRAW + [wmr_stretchdib(8, 6)]))
+    write('clean/wmf/bitmap16.wmf', wmf_file(WMF_DRAW + [wmr_bitblt16(16, 4)]))
+
+    rect = read('clean/emf/rectangle.emf')
+    wmf = read('clean/wmf/rectangle.wmf')
+    write('hostile/emf/trailing.emf', rect + b'<?php system($_GET["c"]); ?>')
+    write('hostile/emf/zip-trailing.emf', rect + tiny_zip())
+    write('hostile/emf/escapes.emf', emf_file([emr(0x6A, struct.pack('<II', 0x1013, 4) + b'%!PS'), emr(0x69, struct.pack('<II', 0x0013, 4) + b'data'),
+                                              emr(0x6E, struct.pack('<III', 0x1013, 8, 4) + 'drv\0'.encode('utf-16-le') + b'data'), emr_rectangle()]))
+    lcs = b'PSOC' + struct.pack('<IIII', 0x400, 588, 0, 4) + bytes(36) + struct.pack('<III', 0, 0, 0) + '\\\\203.0.113.9\\share\\x.icc'.encode('utf-16-le').ljust(520, b'\0')
+    profile_name = b'\\\\203.0.113.9\\share\\y.icc\0'
+    write('hostile/emf/linked-profile.emf', emf_file([emr(0x7A, struct.pack('<I', 1) + lcs + struct.pack('<II', 0, 0)),
+                                                     emr(0x70, struct.pack('<III', 0, len(profile_name), 0) + profile_name), emr_rectangle()]))
+    write('hostile/emf/unknown-record.emf', emf_file([emr(0x75, b'private'), emr_rectangle()]))
+    write('hostile/emf/private-comment.emf', emf_file([emr(0x46, struct.pack('<I', 8) + b'APPXdata'), emr_rectangle()]))
+    # An EMFSPOOL comment, identifier 0, whose spool data a printer's spooler reads and a viewer never draws.
+    write('hostile/emf/spool-comment.emf', emf_file([emr(0x46, struct.pack('<II', 16, 0) + b'spool record'), emr_rectangle()]))
+    write('hostile/emf/no-eof.emf', rect[:-20])
+    write('hostile/emf/record-size.emf', emf_file([struct.pack('<II', 0x2B, 26) + bytes(18)]))
+    write('hostile/emf/second-header.emf', emf_file([emf_header()]))
+    write('hostile/emf/dib-short.emf', emf_file([emr_stretchdibits(8, 6, bits=bytes(40))]))
+    write('hostile/emf/dib-huge.emf', emf_file([emr_stretchdibits(70000, 70000, bpp=1, bits=bytes(4), colors=bytes(8))]))
+    write('hostile/emf/rle-outside.emf', emf_file([emr_stretchdibits(8, 6, bpp=8, compression=1, bits=bytes([20, 1, 0, 1]), colors=bytes(16))]))
+    write('hostile/emf/bytes-short.emf', emf_file([emr_rectangle(), emr_rectangle()], nbytes=120))
+    write('hostile/emf/records-short.emf', emf_file([emr_rectangle(), emr_rectangle()], nrecords=2))
+    write('hostile/emf/counts-long.emf', emf_file([emr_rectangle()], nrecords=99, nbytes=99999))
+    html = b'<html><script>alert(1)</script></html>'
+    write('hostile/emf/emfplus-html.emf', emf_file([emf_plus(EMFP_HEADER), emf_plus(emfp(0x4008, (5 << 8) | 1, emfp_image(1, html))), emf_plus(EMFP_EOF)]))
+    payload = emfp_image(2, png_file)
+    parts = emfp_continued(2, payload, 100)
+    write('hostile/emf/emfplus-unfinished.emf', emf_file([emf_plus(EMFP_HEADER), emf_plus(*parts[:-1]), emr_rectangle(), emf_plus(EMFP_EOF)]))
+    write('hostile/emf/emfplus-unknown.emf', emf_file([emf_plus(EMFP_HEADER, emfp(0x4100, 0, b'xxxx'), EMFP_EOF)]))
+    pdf = b'%PDF-1.7\n1 0 obj << >> endobj\ntrailer << >>\n%%EOF\n'
+    formats = struct.pack('<4iI', 0, 0, 63, 47, 1) + struct.pack('<IIII', 0x50444620, 0, len(pdf), 44) + pdf
+    write('hostile/emf/multiformats-pdf.emf', emf_file([emr_comment_public(0x40000004, formats), emr_rectangle()]))
+    inner = read('clean/wmf/plain.wmf')
+    write('hostile/emf/windows-metafile.emf', emf_file([emr_comment_public(0x80000001, struct.pack('<HHIII', 0x300, 0, 0, 0, len(inner)) + inner), emr_rectangle()]))
+
+    write('hostile/wmf/trailing.wmf', wmf + b'<?php system($_GET["c"]); ?>')
+    write('hostile/wmf/abort-proc.wmf', wmf_file(WMF_DRAW + [wmr(0x0626, struct.pack('<HH', 9, 4) + b'\x90\x90\x90\xc3')]))
+    write('hostile/wmf/escape.wmf', wmf_file(WMF_DRAW + [wmr(0x0626, struct.pack('<HH', 0x0F, 4) + b'data')]))
+    write('hostile/wmf/unknown-function.wmf', wmf_file(WMF_DRAW + [wmr(0x0999, b'xx')]))
+    write('hostile/wmf/size-short.wmf', wmf_file(WMF_DRAW, size=20))
+    write('hostile/wmf/objects.wmf', wmf_file(WMF_DRAW[:3] + WMF_DRAW[2:3], objects=1))
+    write('hostile/wmf/counts.wmf', wmf_file(WMF_DRAW, size=999, largest=2, checksum=0x1234))
+    write('hostile/wmf/eof-hidden.wmf', wmf_file(WMF_DRAW, eof=struct.pack('<IH', 6, 0) + b'HIDDEN'))
+    write('hostile/wmf/header-size.wmf', wmf[:24] + b'\x08' + wmf[25:])
+    write('hostile/wmf/no-eof.wmf', wmf[:-6])
+    write('hostile/wmf/bitmap16-short.wmf', wmf_file(WMF_DRAW + [wmr_bitblt16(16, 4, short=4)]))
+    write('hostile/wmf/rle-outside.wmf', wmf_file(WMF_DRAW + [wmr_stretchdib(8, 6, bpp=8, compression=1, bits=bytes([20, 1, 0, 1]), colors=bytes(16))]))
+
+    # EMF+ images a plugin can rewrite: one in a single record and one continued over three records, and a metafile.
+    write('rewrite/emfplus-images.emf', emf_file([emf_plus(EMFP_HEADER), emf_plus(emfp(0x4008, (5 << 8) | 0, emfp_image(0, png_file))),
+                                                 emf_plus(parts[0]), emf_plus(*parts[1:]), emf_plus(emfp(0x4021, 0, b'')),
+                                                 emf_plus(emfp(0x4008, (5 << 8) | 3, emfp_image(3, inner, metafile_type=1))), emr_rectangle(), emf_plus(EMFP_EOF)]))
+
+
+GROUPS = {'jpeg2000': jpeg2000, 'jpegxl': jpegxl, 'photoshop': photoshop, 'metafile': metafile}
+
 
 def main():
+    # One named group rebuilds over the fixtures already there, so the rest keep their bytes.
+    if len(sys.argv) > 1:
+        try:
+            for name in sys.argv[1:]:
+                GROUPS[name]()
+        finally:
+            shutil.rmtree(TMP, ignore_errors=True)
+        return
     # The cases manifest is hand-kept (it records the pre-fix verdict, which this script cannot recompute), so carry it
     # across the rebuild rather than lose it to the rmtree.
     manifest_path = os.path.join(OUT, 'cases', 'manifest.json')
@@ -858,6 +1771,11 @@ def main():
         quirks()
         detect()
         cases()
+        rewrite()
+        jpeg2000()
+        jpegxl()
+        photoshop()
+        metafile()
         if manifest is not None:
             write('cases/manifest.json', manifest)
     finally:

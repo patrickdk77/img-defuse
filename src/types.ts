@@ -8,6 +8,7 @@ export enum ImageCategory {
   Polyglot = 'POLYGLOT',
   Content = 'CONTENT',
   Limit = 'LIMIT',
+  Processing = 'PROCESSING',
 }
 
 /** Exact variant of a finding. */
@@ -28,6 +29,7 @@ export enum ImageDetail {
   TrailingData = 'TRAILING_DATA',
   HiddenData = 'HIDDEN_DATA',
   ExtraBlock = 'EXTRA_BLOCK',
+  HeaderCount = 'HEADER_COUNT',
   // METADATA
   Exif = 'EXIF',
   Gps = 'GPS',
@@ -45,14 +47,21 @@ export enum ImageDetail {
   // EMBEDDED_IMAGE
   NoPlugin = 'NO_PLUGIN',
   TypeMismatch = 'TYPE_MISMATCH',
+  PluginPassed = 'PLUGIN_PASSED',
+  PluginScrubbed = 'PLUGIN_SCRUBBED',
+  PluginFailed = 'PLUGIN_FAILED',
+  PluginRemoved = 'PLUGIN_REMOVED',
   // EXTERNAL
   LinkedProfile = 'LINKED_PROFILE',
+  LinkedFile = 'LINKED_FILE',
   // POLYGLOT
   Pdf = 'PDF',
   Zip = 'ZIP',
   ImageData = 'IMAGE_DATA',
   // CONTENT
   OldJpeg = 'OLD_JPEG',
+  Escape = 'ESCAPE',
+  AbortProc = 'ABORT_PROC',
   // LIMIT
   FileSize = 'FILE_SIZE',
   Pixels = 'PIXELS',
@@ -62,7 +71,10 @@ export enum ImageDetail {
   Blocks = 'BLOCKS',
   Scans = 'SCANS',
   MetadataSize = 'METADATA_SIZE',
+  NestingDepth = 'NESTING_DEPTH',
   Time = 'TIME',
+  // PROCESSING
+  VerificationFailed = 'VERIFICATION_FAILED',
 }
 
 export type ImageFindingAction = 'reject' | 'strip' | 'info';
@@ -125,6 +137,16 @@ export interface ImageInspection {
   images: number;
 }
 
+export interface ImageDisarmResult {
+  status: 'clean' | 'defused' | 'rejected';
+  /** The uploaded file and its score. */
+  before: ImageInspection;
+  /** The output and its remaining score. Absent when rejected. */
+  after?: ImageInspection;
+  /** Findings whose content was removed. */
+  removed: DefuseFinding[];
+}
+
 /** Random-access input. A buffer, a local file and an S3 ranged GetObject all fit. */
 export interface ByteSource {
   size(): Promise<number>;
@@ -157,6 +179,11 @@ export interface ImageLimits {
   scans?: number;
   /** Bytes one compressed metadata block inflates to. Default 8 MiB. */
   metadataBytes?: number;
+  /**
+   * The deepest an image may sit in the upload. The upload is at depth 0 and a file inside it at 1, and files of
+   * every format in between count. Not enforced unless set.
+   */
+  nestingDepth?: number;
   /** Milliseconds for the whole run. Not enforced unless set. */
   timeMs?: number;
 }
@@ -231,4 +258,13 @@ export interface ImageOptions {
   actionOverrides?: ImageActionOverride[];
   scoreWeights?: ImageScoreWeight[];
   scoreBands?: ImageScoreBands;
+  /** Plugins for the images inside the image: thumbnails and the secondary images an MPF index names. */
+  filePlugins?: ContainedFilePlugin[];
+  /** Directory for temporary files. Defaults to os.tmpdir(). */
+  tempDir?: string;
+  /**
+   * Default 8 MiB. disarmImageSource keeps its copy of the upload, and the output, in memory up to this size and in a
+   * temporary file above it. The copies plugins write of the images inside the image share this much memory.
+   */
+  memoryThreshold?: number;
 }

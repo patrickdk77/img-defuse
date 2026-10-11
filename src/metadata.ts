@@ -42,11 +42,38 @@ export async function hasDoctype(chunks: AsyncIterable<Uint8Array>): Promise<boo
   return false;
 }
 
+/** A thumbnail resource, 0x0409 or 0x040C. Offsets are in the slice. */
+export interface PhotoshopThumbnail {
+  /** The JPEG data, after the resource's 28-byte header. */
+  offset: number;
+  length: number;
+  /** The whole resource, from its signature to the end of its padded data. */
+  resourceStart: number;
+  resourceEnd: number;
+  /** The resource's data size field, and its data, which starts with the 28-byte header. */
+  sizeAt: number;
+  dataStart: number;
+}
+
+/** One image resource. Offsets are in the slice. */
+export interface PhotoshopResource {
+  /** The signature, usually "8BIM". */
+  signature: string;
+  id: number;
+  /** The whole resource, from its signature to the end of its padded data. */
+  start: number;
+  end: number;
+  /** Its data, without the padding. */
+  dataStart: number;
+  dataEnd: number;
+}
+
 export interface PhotoshopResources {
   /** A resource 0x0404 holds IPTC data. */
   iptc: boolean;
-  /** Thumbnail resources 0x0409 and 0x040C: the JPEG data's offset in the slice and its length. */
-  thumbnails: Array<{ offset: number; length: number }>;
+  thumbnails: PhotoshopThumbnail[];
+  /** Every resource, in order. */
+  resources: PhotoshopResource[];
 }
 
 /**
@@ -54,7 +81,7 @@ export interface PhotoshopResources {
  * they are malformed instead, as a string.
  */
 export async function photoshopResources(slice: Slice): Promise<PhotoshopResources | string> {
-  const out: PhotoshopResources = { iptc: false, thumbnails: [] };
+  const out: PhotoshopResources = { iptc: false, thumbnails: [], resources: [] };
   let p = 0;
   while (p < slice.size) {
     if (p + 7 > slice.size) return 'a Photoshop resource ends inside its header';
@@ -69,8 +96,11 @@ export async function photoshopResources(slice: Slice): Promise<PhotoshopResourc
     const size = new View(await slice.read(nameEnd, 4)).u32(0);
     const data = nameEnd + 4;
     if (data + size > slice.size) return 'a Photoshop resource runs past its block';
+    out.resources.push({ signature: sig, id, start: p, end: Math.min(slice.size, data + size + (size & 1)), dataStart: data, dataEnd: data + size });
     if (id === 0x0404) out.iptc = true;
-    if ((id === 0x0409 || id === 0x040c) && size > 28) out.thumbnails.push({ offset: data + 28, length: size - 28 });
+    if ((id === 0x0409 || id === 0x040c) && size > 28) {
+      out.thumbnails.push({ offset: data + 28, length: size - 28, resourceStart: p, resourceEnd: Math.min(slice.size, data + size + (size & 1)), sizeAt: nameEnd, dataStart: data });
+    }
     p = data + size + (size & 1);
   }
   return out;

@@ -1,7 +1,8 @@
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
-import { inspectImage } from '../../src';
+import { disarmImage, inspectImage } from '../../src';
 import { crc32 } from '../../src/crc32';
 import type { DefuseFinding, ImageInspection, ImageOptions } from '../../src/types';
 
@@ -9,6 +10,11 @@ import type { DefuseFinding, ImageInspection, ImageOptions } from '../../src/typ
 export const root = path.join(__dirname, '..', '..', '..');
 export const fixtures = path.join(root, 'test', 'fixtures');
 export const fixture = (...parts: string[]) => fs.readFileSync(path.join(fixtures, ...parts));
+
+const cli = path.join(root, 'dist', 'cli.js');
+/** Runs the built command-line tool. */
+export const runCli = (args: string[], opts: { input?: Buffer; env?: NodeJS.ProcessEnv; cwd?: string } = {}) =>
+  spawnSync(process.execPath, [cli, ...args], { input: opts.input, env: { ...process.env, ...opts.env }, cwd: opts.cwd, maxBuffer: 64 * 1024 * 1024 });
 
 export const kind = (f: DefuseFinding) => `${f.category}/${f.detail}`;
 export const kinds = (i: { findings: DefuseFinding[] }) => i.findings.map(kind);
@@ -133,4 +139,74 @@ export function gifOf(width: number, height: number, pixels: number[], minCodeSi
   image.writeUInt16LE(width, 5);
   image.writeUInt16LE(height, 7);
   return Buffer.concat([head, table, image, Buffer.from([minCodeSize]), subBlocks(lzwEncode(pixels, minCodeSize)), Buffer.from([0x3b])]);
+}
+
+// ---------- disarm helpers ----------
+
+/** Disarms a fixture. */
+export const disarmFixture = (options: ImageOptions, ...parts: string[]) => disarmImage(fixture(...parts), options);
+
+/** The output of a disarm, or a failed test when the file was rejected. */
+export function output(r: { bytes?: Uint8Array }): Buffer {
+  return Buffer.from(must(r.bytes, 'the defused bytes'));
+}
+
+/** The kinds of finding with an action other than info. */
+export const acted = (i: { findings: DefuseFinding[] }) => [...new Set(i.findings.filter(f => f.action !== 'info').map(kind))];
+
+/** The chunks of a PNG, in order, as [type, data]. */
+export function pngChunks(bytes: Uint8Array): Array<[string, Buffer]> {
+  const b = Buffer.from(bytes);
+  const out: Array<[string, Buffer]> = [];
+  for (let p = 8; p + 12 <= b.length; ) {
+    const n = b.readUInt32BE(p);
+    out.push([b.toString('latin1', p + 4, p + 8), b.subarray(p + 8, p + 8 + n)]);
+    p += 12 + n;
+  }
+  return out;
+}
+
+/** The marker segments of a JPEG up to EOI, as [marker, payload], with each scan's entropy-coded data after its SOS. */
+export function jpegSegments(bytes: Uint8Array): Array<[number, Buffer]> {
+  const b = Buffer.from(bytes);
+  const out: Array<[number, Buffer]> = [];
+  let p = 2;
+  while (p < b.length) {
+    // Fill bytes and any other bytes between segments are no part of the image.
+    while (p < b.length && !(b[p] === 0xff && b[p + 1] !== 0xff && b[p + 1] !== 0)) p++;
+    const marker = b[p + 1];
+    if (marker === 0xd9) break;
+    const n = b.readUInt16BE(p + 2);
+    out.push([marker, b.subarray(p + 4, p + 2 + n)]);
+    p += 2 + n;
+    if (marker === 0xda) {
+      let q = p;
+      while (!(b[q] === 0xff && b[q + 1] !== 0 && (b[q + 1] < 0xd0 || b[q + 1] > 0xd7) && b[q + 1] !== 0xff)) q++;
+      out.push([-1, b.subarray(p, q)]);
+      p = q;
+    }
+  }
+  return out;
+}
+
+/** What a JPEG decoder reads for its pixels: the tables, frame, scans and their data, without APP and COM segments. */
+export const jpegCore = (bytes: Uint8Array) =>
+  Buffer.concat(
+    jpegSegments(bytes)
+      .filter(([m]) => !(m >= 0xe0 && m <= 0xef) && m !== 0xfe)
+      .map(([m, d]) => Buffer.concat([Buffer.from([m & 0xff]), d])),
+  );
+
+/** The image data of each PNG frame, inflated: IDAT first, then each run of fdAT chunks. */
+export function pngFrames(bytes: Uint8Array): Buffer[] {
+  const frames: Buffer[][] = [];
+  let last = '';
+  for (const [type, data] of pngChunks(bytes)) {
+    if (type === 'IDAT' || type === 'fdAT') {
+      if (type !== last) frames.push([]);
+      frames[frames.length - 1].push(type === 'fdAT' ? data.subarray(4) : data);
+    }
+    last = type;
+  }
+  return frames.map(parts => zlib.inflateSync(Buffer.concat(parts)));
 }

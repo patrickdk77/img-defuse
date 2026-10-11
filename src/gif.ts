@@ -1,13 +1,29 @@
 import type { Run } from './context';
 import { LzwCounter } from './lzw';
 import { checkIcc, hasDoctype } from './metadata';
+import { bytes, copy, type Piece } from './rewrite';
 import { fileSlice, joinedSlice, latin1, View } from './slice';
-import { ImageCategory as C, ImageDetail as D } from './types';
+import { ImageCategory as C, ImageDetail as D, type DefuseFinding } from './types';
+
+/**
+ * A block as the rewrite sees it. copy: written as it is. gce: a graphic control extension, which goes with a plain
+ * text extension the rewrite drops, since it would otherwise apply to the next image. image: written with its LZW
+ * data cut after the end code. optional: written unless its findings or a signature in it remove it.
+ */
+type Item =
+  | { kind: 'copy'; start: number; end: number }
+  | { kind: 'gce'; start: number; end: number }
+  | { kind: 'image'; start: number; data: number; endAt?: number; end: number }
+  | { kind: 'optional'; start: number; end: number; findings: Array<DefuseFinding | undefined>; plainText: boolean };
+
+export interface GifPlan {
+  items: Item[];
+}
 
 /** Application extensions viewers use: the loop count and buffering. */
 const KEPT_APPS = new Set(['NETSCAPE2.0', 'ANIMEXTS1.0']);
 
-export async function inspectGif(run: Run): Promise<void> {
+export async function inspectGif(run: Run): Promise<GifPlan> {
   const r = run.reader;
   const size = run.size;
   if (size < 13) run.stop(D.Truncated, 'the screen descriptor is cut short', 'header');
@@ -23,6 +39,7 @@ export async function inspectGif(run: Run): Promise<void> {
   const globalEntries = packed & 0x80 ? 2 ** ((packed & 7) + 1) : 0;
   let pos = 13 + globalEntries * 3;
   if (pos > size) run.stop(D.Truncated, 'the global color table is cut short', 'screen descriptor at 6');
+  const items: Item[] = [{ kind: 'copy', start: 0, end: pos }];
 
   /** Walks sub-blocks from `p`, handing each one's data range to `each`. Returns the offset after the terminator. */
   const subBlocks = async (p: number, loc: string, each?: (start: number, data: Uint8Array) => void): Promise<number> => {
@@ -78,6 +95,7 @@ export async function inspectGif(run: Run): Promise<void> {
         failure = lzw.feed(data);
         if (!wasEnded && lzw.ended && hiddenFrom < 0) hiddenFrom = at + lzw.endIndex + 1;
       });
+      items.push({ kind: 'image', start: pos, data: p, endAt: hiddenFrom < 0 ? undefined : hiddenFrom, end });
       if (failure) run.stop(D.BadData, failure, loc);
       if (lzw.produced < width * height) run.stop(D.BadData, `the image data ends after ${lzw.produced} of ${width * height} pixels`, loc);
       if (entries && lzw.maxIndex >= entries) run.report(C.Structure, D.Ambiguous, loc, { reason: `color index ${lzw.maxIndex} is past the ${entries}-entry table` });
@@ -98,15 +116,16 @@ export async function inspectGif(run: Run): Promise<void> {
       if (b.length < 7) run.stop(D.Truncated, 'a graphic control extension is cut short', loc);
       if (b[0] !== 4 || b[5] !== 0) run.stop(D.BadLayout, 'a graphic control extension is not 4 bytes', loc);
       pos += 8;
+      items.push({ kind: 'gce', start, end: pos });
       continue;
     }
     if (label === 0xfe) {
       const loc = `comment extension at ${start}`;
-      let bytes = 0;
+      let total = 0;
       pos = await subBlocks(pos + 2, loc, (_, d) => {
-        bytes += d.length;
+        total += d.length;
       });
-      run.metadata(D.Comment, loc, start, pos, { bytes });
+      items.push({ kind: 'optional', start, end: pos, findings: [run.metadata(D.Comment, loc, start, pos, { bytes: total })], plainText: false });
       continue;
     }
     if (label === 0xff) {
@@ -120,25 +139,95 @@ export async function inspectGif(run: Run): Promise<void> {
         ranges.push([s, d.length]);
       });
       const named = `${loc} (${app.replace(/[^\x20-\x7e]/g, '?')})`;
-      if (KEPT_APPS.has(app)) continue;
+      if (KEPT_APPS.has(app)) {
+        items.push({ kind: 'copy', start, end: pos });
+        continue;
+      }
+      const findings: Array<DefuseFinding | undefined> = [];
       if (app === 'XMP DataXMP') {
-        run.metadata(D.Xmp, named, start, pos);
-        if (await hasDoctype(fileSlice(r, dataStart, pos - dataStart).chunks())) run.report(C.Metadata, D.Doctype, named);
+        findings.push(run.metadata(D.Xmp, named, start, pos));
+        if (await hasDoctype(fileSlice(r, dataStart, pos - dataStart).chunks())) findings.push(run.report(C.Metadata, D.Doctype, named));
       } else if (app === 'ICCRGBG1012') {
         const why = await checkIcc(joinedSlice(r, ranges));
-        if (why) run.malformed(named, start, pos, why);
-        else run.metadata(D.IccProfile, named, start, pos);
+        findings.push(why ? run.malformed(named, start, pos, why) : run.metadata(D.IccProfile, named, start, pos));
       } else if (app === 'MGK8BIM0000' || app === 'MGKIPTC0000') {
-        run.metadata(D.Iptc, named, start, pos);
+        findings.push(run.metadata(D.Iptc, named, start, pos));
       } else {
-        run.extra(named, start, pos, { block: `application extension ${app.replace(/[^\x20-\x7e]/g, '?')}` });
+        findings.push(run.extra(named, start, pos, { block: `application extension ${app.replace(/[^\x20-\x7e]/g, '?')}` }));
       }
+      items.push({ kind: 'optional', start, end: pos, findings, plainText: false });
       continue;
     }
     // A plain text extension, which few viewers draw, or an unknown extension: both are skipped by viewers.
     const loc = `${label === 0x01 ? 'plain text' : `0x${label.toString(16).padStart(2, '0')}`} extension at ${start}`;
     pos = await subBlocks(pos + 2, loc);
-    run.extra(loc, start, pos, { block: label === 0x01 ? 'plain text extension' : 'unknown extension' });
+    items.push({ kind: 'optional', start, end: pos, findings: [run.extra(loc, start, pos, { block: label === 0x01 ? 'plain text extension' : 'unknown extension' })], plainText: label === 0x01 });
   }
   await run.gap(pos, size, 'trailing');
+  return { items };
+}
+
+/** An image's descriptor, color table and LZW data, with the data cut after the end code and sub-blocks kept whole before it. */
+async function imagePieces(run: Run, it: { start: number; data: number; endAt?: number }): Promise<Piece[]> {
+  const out: Piece[] = [copy(it.start, it.data - it.start)];
+  for (let q = it.data; ; ) {
+    run.time();
+    const n = (await run.reader.read(q, 1))[0];
+    if (n === 0) break;
+    const blockEnd = q + 1 + n;
+    if (it.endAt === undefined || blockEnd <= it.endAt) {
+      out.push(copy(q, 1 + n));
+      if (blockEnd === it.endAt) break;
+    } else {
+      const keep = it.endAt - (q + 1);
+      if (keep > 0) out.push(bytes(Uint8Array.of(keep)), copy(q + 1, keep));
+      break;
+    }
+    q = blockEnd;
+  }
+  out.push(bytes(Uint8Array.of(0)));
+  return out;
+}
+
+/**
+ * The GIF as the rewrite writes it: the header, screen descriptor and global color table, every block the plan keeps,
+ * and the trailer. A graphic control extension waits until the block it applies to is decided, and goes with a plain
+ * text extension that goes.
+ */
+export async function gifPieces(run: Run, plan: GifPlan): Promise<Piece[]> {
+  const out: Piece[] = [];
+  // A graphic control extension and the blocks after it that are not graphics, waiting for the next graphic.
+  let pending: Piece[] | undefined;
+  const flush = (keepControl: boolean) => {
+    if (pending) out.push(...(keepControl ? pending : pending.slice(1)));
+    pending = undefined;
+  };
+  const put = (...p: Piece[]) => (pending ? pending.push(...p) : out.push(...p));
+  for (const it of plan.items) {
+    switch (it.kind) {
+      case 'copy':
+        put(copy(it.start, it.end - it.start));
+        break;
+      case 'gce':
+        flush(true);
+        pending = [copy(it.start, it.end - it.start)];
+        break;
+      case 'image': {
+        const image = await imagePieces(run, it);
+        flush(true);
+        out.push(...image);
+        break;
+      }
+      default: {
+        const dropped = run.drops(it.findings, it.start, it.end);
+        if (it.plainText) {
+          flush(!dropped);
+          if (!dropped) out.push(copy(it.start, it.end - it.start));
+        } else if (!dropped) put(copy(it.start, it.end - it.start));
+      }
+    }
+  }
+  flush(true);
+  out.push(bytes(Uint8Array.of(0x3b)));
+  return out;
 }

@@ -21,6 +21,9 @@ const TYPE_SIZES = new Map<number, number>([
   [18, 8],
 ]);
 
+/** Bytes in one value of a TIFF field type, or 1 for a type TIFF does not define. */
+export const typeSize = (type: number): number => TYPE_SIZES.get(type) ?? 1;
+
 /** A refusal from the IFD reader. A TIFF file stops the run on it; an EXIF block reports itself malformed. */
 export class IfdError extends Error {
   constructor(
@@ -45,6 +48,8 @@ export interface IfdEntry {
   at: number;
   /** The value sits inside the entry, not elsewhere in the file. */
   inline: boolean;
+  /** Where the entry itself starts, in the slice. */
+  pos: number;
 }
 
 export interface Ifd {
@@ -57,6 +62,8 @@ export interface Ifd {
   duplicates: number[];
   /** The next IFD's offset, 0 at the end of the chain. */
   next: number;
+  /** The entry count the IFD gives, null entries included. */
+  declared: number;
 }
 
 /** Reads IFDs and their values from a TIFF structure: a TIFF file, or the EXIF block inside another format. */
@@ -90,6 +97,17 @@ export class IfdReader {
   /** The header's length. */
   get headerSize(): number {
     return this.big ? 16 : 8;
+  }
+
+  /** Bytes in an IFD's entry count, in one entry, and in an offset or an inline value. */
+  get countSize(): number {
+    return this.big ? 8 : 2;
+  }
+  get entrySize(): number {
+    return this.big ? 20 : 12;
+  }
+  get offsetSize(): number {
+    return this.big ? 8 : 4;
   }
 
   private u64(v: View, at: number, what: string): number {
@@ -132,13 +150,13 @@ export class IfdReader {
         at = this.big ? this.u64(v, e + 12, 'a value offset') : v.u32(e + 8);
         if (at + size > this.slice.size) bad(D.Truncated, `the value of tag ${tag} lies outside the file`);
       }
-      const entry: IfdEntry = { tag, type, count: n, size, at, inline };
+      const entry: IfdEntry = { tag, type, count: n, size, at, inline, pos: offset + countSize + e };
       entries.push(entry);
       if (byTag.has(tag)) duplicates.push(tag);
       else byTag.set(tag, entry);
     }
     const next = this.big ? this.u64(v, count * entrySize, 'the next IFD offset') : v.u32(count * entrySize);
-    return { start: offset, end, entries, byTag, duplicates, next };
+    return { start: offset, end, entries, byTag, duplicates, next, declared: count };
   }
 
   /** The values of an integer entry: BYTE, SHORT, LONG, IFD, their signed forms, and BigTIFF's 8-byte ones. */

@@ -61,7 +61,7 @@ describe('metadata', () => {
     expect(await hasDoctype(pieces(Buffer.from('<!DOCTYPE x>', 'utf16le').toString('latin1')))).to.equal(true);
   });
 
-  it('reads Photoshop resources for IPTC and thumbnails', async () => {
+  it('reads Photoshop resources for IPTC and thumbnails, and lists every resource', async () => {
     const res = (id: number, data: Buffer) => {
       const head = Buffer.from('8BIM\0\0\0\0\0\0\0\0', 'latin1');
       head.writeUInt16BE(id, 4);
@@ -69,7 +69,14 @@ describe('metadata', () => {
       return Buffer.concat([head, data, data.length % 2 ? Buffer.alloc(1) : Buffer.alloc(0)]);
     };
     const parsed = await photoshopResources(bytesSlice(Buffer.concat([res(0x0404, Buffer.alloc(3)), res(0x040c, Buffer.alloc(40))])));
-    expect(parsed).to.deep.equal({ iptc: true, thumbnails: [{ offset: 16 + 12 + 28, length: 12 }] });
+    expect(parsed).to.deep.equal({
+      iptc: true,
+      thumbnails: [{ offset: 16 + 12 + 28, length: 12, resourceStart: 16, resourceEnd: 16 + 12 + 40, sizeAt: 16 + 8, dataStart: 16 + 12 }],
+      resources: [
+        { signature: '8BIM', id: 0x0404, start: 0, end: 16, dataStart: 12, dataEnd: 15 },
+        { signature: '8BIM', id: 0x040c, start: 16, end: 68, dataStart: 28, dataEnd: 68 },
+      ],
+    });
     expect(await photoshopResources(bytesSlice(Buffer.from('nope')))).to.equal('a Photoshop resource ends inside its header');
     expect(await photoshopResources(bytesSlice(Buffer.from('ABCDEFGH')))).to.equal('a Photoshop resource has no 8BIM signature');
   });

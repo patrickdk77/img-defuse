@@ -6,10 +6,7 @@ import { fixture, inspectFixture, kinds } from './helpers/util';
 describe('format detection', () => {
   it('names the format from the first bytes', () => {
     const head = (...parts: Array<string | number[]>) => Buffer.concat(parts.map(p => (typeof p === 'string' ? Buffer.from(p, 'latin1') : Buffer.from(p))));
-    const formatOf = (b: Buffer) => {
-      const d = detect(b);
-      return d && 'kind' in d ? d.format : d?.unsupported;
-    };
+    const formatOf = (b: Buffer) => detect(b)?.format;
     expect(formatOf(head([0x89], 'PNG\r\n\x1a\n'))).to.equal('png');
     expect(formatOf(head([0xff, 0xd8, 0xff, 0xe0]))).to.equal('jpg');
     expect(formatOf(head('GIF87a'))).to.equal('gif');
@@ -22,22 +19,18 @@ describe('format detection', () => {
     expect(formatOf(head([0, 0, 1, 0, 1, 0]))).to.equal('ico');
     expect(formatOf(head([0, 0, 2, 0, 1, 0]))).to.equal('cur');
     expect(formatOf(head([0, 0, 1, 0, 0, 0]))).to.equal(undefined);
-  });
-
-  it('rejects the formats a later version reads as unsupported, naming them', async () => {
-    const expected: Record<string, string> = {
-      'jp2.jp2': 'jp2',
-      'j2k.j2k': 'j2k',
-      'jxl.jxl': 'jxl',
-      'jxl-box.jxl': 'jxl',
-      'psd.psd': 'psd',
-      'emf.emf': 'emf',
-      'wmf.wmf': 'wmf',
-    };
-    for (const [name, format] of Object.entries(expected)) {
-      const r = await inspectFixture({}, 'detect', name);
-      expect([name, r.status, r.score, r.risk, kinds(r), r.findings[0].data?.format, r.format]).to.deep.equal([name, 'rejected', null, 'UNKNOWN', ['FORMAT/UNSUPPORTED'], format, '']);
-    }
+    expect(formatOf(head([0, 0, 0, 0x0c], 'jP  \r\n', [0x87], '\n'))).to.equal('jp2');
+    expect(formatOf(head([0xff, 0x4f, 0xff, 0x51]))).to.equal('j2c');
+    expect(formatOf(head([0xff, 0x0a]))).to.equal('jxl');
+    expect(formatOf(head([0, 0, 0, 0x0c], 'JXL \r\n', [0x87], '\n'))).to.equal('jxl');
+    expect(formatOf(head('8BPS', [0, 1]))).to.equal('psd');
+    expect(formatOf(head('8BPS', [0, 2]))).to.equal('psb');
+    expect(formatOf(head([1, 0, 0, 0], new Array(36).fill(0), ' EMF'))).to.equal('emf');
+    expect(formatOf(head([1, 0, 0, 0], new Array(36).fill(0), ' EMX'))).to.equal(undefined);
+    expect(formatOf(head([0xd7, 0xcd, 0xc6, 0x9a]))).to.equal('wmf');
+    expect(formatOf(head([1, 0, 9, 0, 0, 3]))).to.equal('wmf');
+    expect(formatOf(head([2, 0, 9, 0, 0, 1]))).to.equal('wmf');
+    expect(formatOf(head([1, 0, 9, 0, 0, 2]))).to.equal(undefined);
   });
 
   it('rejects anything else as unrecognized, HEIC, AVIF and SVG included', async () => {

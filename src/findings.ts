@@ -32,6 +32,13 @@ def(C.Structure, D.Ambiguous, 'reject', 0, 'Readers can draw or read this in dif
 def(C.Structure, D.TrailingData, 'strip', 10, 'Data after the end of the image');
 def(C.Structure, D.HiddenData, 'strip', 20, 'Data between the parts of the image that nothing uses');
 def(C.Structure, D.ExtraBlock, 'strip', 10, 'A block that viewers do not use<: {block}|>');
+def(
+  C.Structure,
+  D.HeaderCount,
+  'strip',
+  10,
+  'A header count is smaller than what the file holds, so a reader that trusts it stops early or makes too few objects. The copy holds the right count<: {reason}|>',
+);
 // METADATA
 def(C.Metadata, D.Exif, 'info', 0, 'EXIF metadata, such as the camera, settings and dates');
 def(C.Metadata, D.Gps, 'info', 0, 'GPS location metadata');
@@ -45,18 +52,25 @@ def(C.Metadata, D.SecondaryImage, 'info', 0, 'An extra image stored after the ma
 def(C.Metadata, D.Other, 'info', 0, 'Other metadata<: {kind}|>');
 def(C.Metadata, D.Stripped, 'info', 0, 'Metadata removed because the caller turned on metadata stripping');
 def(C.Metadata, D.Malformed, 'strip', 20, 'A metadata block does not parse<: {reason}|>');
-def(C.Metadata, D.Doctype, 'strip', 40, 'XMP metadata declares a document type or entities, which an XML reader may resolve');
+def(C.Metadata, D.Doctype, 'strip', 40, 'XML metadata, such as XMP, declares a document type or entities, which an XML reader may resolve');
 // EMBEDDED_IMAGE
-def(C.EmbeddedImage, D.NoPlugin, 'strip', 10, 'An image inside the image <({sniffed})|(unknown type)> is removed. No plugin accepts it');
+def(C.EmbeddedImage, D.NoPlugin, 'strip', 10, 'An image inside the image <({sniffed})|(unknown type)> is removed<. {reason}|. No plugin accepts it>');
 def(C.EmbeddedImage, D.TypeMismatch, 'info', 40, 'An image inside the image is declared <{declared}|as an image> but <its content looks like {sniffed}|its content is not recognized>');
+def(C.EmbeddedImage, D.PluginPassed, 'info', 6, 'An image inside the image is kept by plugin <plugin> with nothing removed');
+def(C.EmbeddedImage, D.PluginScrubbed, 'info', 3, 'An image inside the image is cleaned and kept by plugin <plugin>');
+def(C.EmbeddedImage, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the image inside the image is removed<: {reason}|>');
+def(C.EmbeddedImage, D.PluginRemoved, 'strip', 0, 'The image inside the image is removed by plugin <plugin>');
 // EXTERNAL
 def(C.External, D.LinkedProfile, 'strip', 40, 'The image loads its color profile from <{target}|a file outside it>');
+def(C.External, D.LinkedFile, 'strip', 40, 'The image names a file outside it that a reader may load<: {target}|>');
 // POLYGLOT
 def(C.Polyglot, D.Pdf, 'strip', 50, 'A PDF header sits where PDF readers look for one, so the file also opens as a PDF');
 def(C.Polyglot, D.Zip, 'strip', 50, 'A ZIP directory sits where ZIP readers look for one, so the file also opens as an archive');
 def(C.Polyglot, D.ImageData, 'reject', 60, 'Image data the viewer needs holds <a {kind}|another format> signature, so the file also opens as another format');
 // CONTENT
 def(C.Content, D.OldJpeg, 'info', 20, 'An image uses old-style JPEG compression in TIFF, a past source of reader exploits');
+def(C.Content, D.Escape, 'strip', 20, 'A metafile record passes data straight to the printer driver<: {escape}|>');
+def(C.Content, D.AbortProc, 'strip', 70, 'A metafile record sets an abort procedure, the escape behind the 2005 WMF code execution flaw');
 // LIMIT. Every one stops the run.
 def(C.Limit, D.FileSize, 'reject', 0, 'The file exceeds the file size limit');
 def(C.Limit, D.Pixels, 'reject', 0, 'An image exceeds the pixel limit');
@@ -66,7 +80,10 @@ def(C.Limit, D.Frames, 'reject', 0, 'The file exceeds the frame limit');
 def(C.Limit, D.Blocks, 'reject', 0, 'The file exceeds the block limit');
 def(C.Limit, D.Scans, 'reject', 0, 'The JPEG exceeds the scan limit');
 def(C.Limit, D.MetadataSize, 'reject', 0, 'A compressed metadata block exceeds the metadata size limit');
+def(C.Limit, D.NestingDepth, 'reject', 0, 'The image exceeds the nesting depth limit');
 def(C.Limit, D.Time, 'reject', 0, 'The file exceeds the time limit');
+// PROCESSING
+def(C.Processing, D.VerificationFailed, 'reject', 0, 'The defused output did not pass its own inspection, so nothing was written<: {reasons}|>');
 
 /** The built-in spec for a kind of finding, or undefined for a kind img-defuse does not make, such as one from another package. */
 export function findingSpec(category: string, detail: string): Spec | undefined {

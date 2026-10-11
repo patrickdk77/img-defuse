@@ -1,10 +1,11 @@
 import { clip, type Run } from './context';
 import { crc32 } from './crc32';
-import { inspectExif } from './exif';
+import { type ExifPlan, exifPieces, inspectExif } from './exif';
 import { InflateError, inflateChunks } from './inflate';
 import { checkIcc, hasDoctype } from './metadata';
+import { ascii, bytes, copy, crcEnd, crcStart, lengthOf, type Piece, u32 } from './rewrite';
 import { allZero, bytesSlice, fileSlice, latin1, View } from './slice';
-import { ImageCategory as C, ImageDetail as D } from './types';
+import { ImageCategory as C, ImageDetail as D, type DefuseFinding, type ImageFinding } from './types';
 
 const SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 /** Chunks read whole into memory up to this size. Larger ones are read in pieces. */
@@ -114,6 +115,25 @@ interface Stream {
   chunks: Chunk[];
   /** Bytes to skip at the start of each chunk's data: 4 for fdAT. */
   skip: number;
+  /** Bytes of compressed data up to the end of the zlib stream, once decoded. The rewrite drops the rest. */
+  consumed?: number;
+}
+
+/**
+ * A chunk as the rewrite sees it. keep: written as it is. optional: written unless its findings or a signature in it
+ * remove it. frame: an fcTL, written with the next sequence number. stream: an IDAT or fdAT, cut at the end of its
+ * zlib stream.
+ */
+interface PlannedChunk {
+  chunk: Chunk;
+  role: 'keep' | 'optional' | 'frame' | 'stream';
+  findings: Array<DefuseFinding | undefined>;
+  stream?: Stream;
+  exif?: { plan: ExifPlan; skip: number };
+}
+
+export interface PngPlan {
+  chunks: PlannedChunk[];
 }
 
 export interface PngOptions {
@@ -124,7 +144,7 @@ export interface PngOptions {
 }
 
 /** Inspects the PNG at [start, end) of the file. */
-export async function inspectPng(run: Run, start: number, end: number, o: PngOptions): Promise<{ width: number; height: number; frames: number }> {
+export async function inspectPng(run: Run, start: number, end: number, o: PngOptions): Promise<{ width: number; height: number; frames: number; plan: PngPlan }> {
   const r = run.reader;
   const at = (what: string, offset: number) => `${o.prefix}${what} at ${offset}`;
   const sig = await r.read(start, 8);
@@ -143,6 +163,8 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
   let frames = 0;
   let pending: Stream | undefined;
   let ended = false;
+  const plan: PngPlan = { chunks: [] };
+  let idatStream: Stream | undefined;
 
   /** Whether a chunk's CRC matches, reading its data in pieces so a large chunk costs little memory. */
   const crcMatches = async (c: Chunk): Promise<boolean> => {
@@ -205,6 +227,7 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
         run.deadline,
       );
       consumed = done.consumed;
+      s.consumed = consumed;
       if (done.produced !== expected) run.stop(D.BadData, `the image data inflates to ${done.produced} bytes, not ${expected}`, s.label);
     } catch (e) {
       if (!(e instanceof InflateError)) throw e;
@@ -267,6 +290,11 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
     // A chunk read whole for its value. Larger chunks are checked in pieces.
     let data: Uint8Array | undefined;
     let badCrc = false;
+    const entry: PlannedChunk = { chunk: c, role: 'keep', findings: [] };
+    const optional = (...findings: Array<DefuseFinding | undefined>) => {
+      entry.role = 'optional';
+      entry.findings.push(...findings);
+    };
     if (type !== 'IDAT' && type !== 'fdAT') {
       let matches: boolean;
       if (length <= SMALL) {
@@ -281,11 +309,11 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
         // with a bad CRC is dropped instead, which is what libpng warns-and-skips and image-png's default
         // skip_ancillary_crc_failures do, so a stale CRC on metadata does not reject the file.
         if (critical) run.stop(D.BadChecksum, `the ${type} chunk's CRC does not match`, loc);
-        run.extra(loc, c.start, c.end, { block: `${type} chunk`, reason: 'its CRC does not match' });
+        optional(run.extra(loc, c.start, c.end, { block: `${type} chunk`, reason: 'its CRC does not match' }));
         badCrc = true;
       }
     }
-    const extra = (reason: string) => run.extra(loc, c.start, c.end, { block: `${type} chunk`, reason });
+    const extra = (reason: string) => optional(run.extra(loc, c.start, c.end, { block: `${type} chunk`, reason }));
 
     if (!badCrc)
       switch (type) {
@@ -328,6 +356,9 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
           }
           idatState = 'in';
           idat.push(c);
+          idatStream ??= { label: at('IDAT chunk', c.start), width: h.width, height: h.height, chunks: idat, skip: 0 };
+          entry.role = 'stream';
+          entry.stream = idatStream;
           break;
         }
         case 'IEND': {
@@ -335,7 +366,7 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
           if (idatState === 'before') run.stop(D.BadLayout, 'the PNG has no IDAT', loc);
           await finishFrame();
           const h = header as Header;
-          await decode({ label: at('IDAT chunk', idat[0].start), width: h.width, height: h.height, chunks: idat, skip: 0 });
+          await decode(idatStream ?? { label: at('IDAT chunk', idat[0].start), width: h.width, height: h.height, chunks: idat, skip: 0 });
           if (animation && fctls !== animation.frames) run.stop(D.BadLayout, `acTL gives ${animation.frames} frames and the file has ${fctls}`, loc);
           ended = true;
           break;
@@ -346,7 +377,7 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
           const h = header as Header;
           if (type === 'acTL') {
             if (count > 1) {
-              run.report(C.Structure, D.Ambiguous, loc, { reason: 'acTL appears twice' });
+              optional(run.report(C.Structure, D.Ambiguous, loc, { reason: 'acTL appears twice' }));
               break;
             }
             if (idatState !== 'before') {
@@ -379,6 +410,7 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
             fctls++;
             // A frame before IDAT takes IDAT as its data. Any other frame needs fdAT chunks.
             pending = { label: loc, width: fw, height: fh, chunks: [], skip: 4 };
+            entry.role = 'frame';
             break;
           }
           // fdAT
@@ -388,6 +420,8 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
           if (seq !== sequence) run.stop(D.BadLayout, `fdAT has the sequence number ${seq} where ${sequence} belongs`, loc);
           sequence++;
           pending?.chunks.push(c);
+          entry.role = 'stream';
+          entry.stream = pending;
           break;
         }
         case 'iCCP':
@@ -396,14 +430,17 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
         case 'iTXt':
         case 'eXIf':
         case 'tIME':
-        case 'caBX':
-          if (UNIQUE.has(type) && count > 1) run.report(C.Structure, D.Ambiguous, loc, { reason: `${type} appears twice` });
+        case 'caBX': {
+          if (UNIQUE.has(type) && count > 1) optional(run.report(C.Structure, D.Ambiguous, loc, { reason: `${type} appears twice` }));
           if (type === 'iCCP' && !placed(type, sawPlte, idatState, (header as Header).colorType)) {
             extra('out of place');
             break;
           }
-          await metadataChunk(run, c, data, loc);
+          const m = await metadataChunk(run, c, data, loc);
+          optional(...m.findings);
+          if (m.exif) entry.exif = m.exif;
           break;
+        }
         default: {
           if (critical) run.stop(D.BadLayout, `the critical chunk ${type} is unknown`, loc);
           const place = PLACEMENT.get(type);
@@ -412,7 +449,7 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
             break;
           }
           if (UNIQUE.has(type) && count > 1) {
-            run.report(C.Structure, D.Ambiguous, loc, { reason: `${type} appears twice` });
+            optional(run.report(C.Structure, D.Ambiguous, loc, { reason: `${type} appears twice` }));
             break;
           }
           if (!placed(type, sawPlte, idatState, (header as Header).colorType)) {
@@ -423,10 +460,11 @@ export async function inspectPng(run: Run, start: number, end: number, o: PngOpt
           if (why) extra(why);
         }
       }
+    plan.chunks.push(entry);
     pos = c.end;
   }
   await run.gap(pos, end, o.afterEnd);
-  return { width: header?.width ?? 0, height: header?.height ?? 0, frames };
+  return { width: header?.width ?? 0, height: header?.height ?? 0, frames, plan };
 }
 
 /** Whether an ancillary chunk sits where the specification places it. */
@@ -465,53 +503,40 @@ function invalid(type: string, length: number, data: Uint8Array | undefined, h: 
 
 const RAW_PROFILE = /^Raw profile type (exif|app1|iptc|8bim|xmp|icc|icm)$/i;
 
-/** Reports a metadata chunk: iCCP, a text chunk, eXIf, tIME or caBX. */
-async function metadataChunk(run: Run, c: Chunk, data: Uint8Array | undefined, loc: string): Promise<void> {
+/** Reports a metadata chunk: iCCP, a text chunk, eXIf, tIME or caBX. Returns the findings that name the chunk, and an eXIf chunk's EXIF block. */
+async function metadataChunk(run: Run, c: Chunk, data: Uint8Array | undefined, loc: string): Promise<{ findings: ImageFinding[]; exif?: { plan: ExifPlan; skip: number } }> {
   const r = run.reader;
   if (c.type === 'eXIf') {
     let skip = 0;
     const head = await r.read(c.data, Math.min(6, c.length));
     if (latin1(head) === 'Exif\0\0') skip = 6;
-    await inspectExif(run, fileSlice(r, c.data + skip, c.length - skip), loc, c.start, c.end);
-    return;
+    const plan = await inspectExif(run, fileSlice(r, c.data + skip, c.length - skip), loc, c.start, c.end);
+    return { findings: [], exif: { plan, skip } };
   }
   if (c.type === 'tIME') {
-    if (c.length !== 7) run.malformed(loc, c.start, c.end, 'tIME is not 7 bytes');
-    else run.metadata(D.Other, loc, c.start, c.end, { kind: 'modification time' });
-    return;
+    if (c.length !== 7) return { findings: [run.malformed(loc, c.start, c.end, 'tIME is not 7 bytes')] };
+    return { findings: [run.metadata(D.Other, loc, c.start, c.end, { kind: 'modification time' })] };
   }
-  if (c.type === 'caBX') {
-    run.metadata(D.Other, loc, c.start, c.end, { kind: 'C2PA content credentials' });
-    return;
-  }
+  if (c.type === 'caBX') return { findings: [run.metadata(D.Other, loc, c.start, c.end, { kind: 'C2PA content credentials' })] };
+  const malformed = (why: string) => ({ findings: [run.malformed(loc, c.start, c.end, why)] });
   // iCCP and text chunks start with a keyword of 1 to 79 Latin-1 bytes and a NUL.
   const head = data ?? (await r.read(c.data, Math.min(c.length, 300)));
   const nul = head.indexOf(0);
-  if (nul < 1 || nul > 79) {
-    run.malformed(loc, c.start, c.end, `the ${c.type} keyword is missing or longer than 79 bytes`);
-    return;
-  }
+  if (nul < 1 || nul > 79) return malformed(`the ${c.type} keyword is missing or longer than 79 bytes`);
   const keyword = latin1(head.subarray(0, nul));
   const body = (from: number) => fileSlice(r, c.data + from, c.length - from);
   if (c.type === 'iCCP') {
-    if (head[nul + 1] !== 0) {
-      run.malformed(loc, c.start, c.end, 'iCCP names a compression method PNG does not define');
-      return;
-    }
+    if (head[nul + 1] !== 0) return malformed('iCCP names a compression method PNG does not define');
     const profile = await inflateMetadata(run, body(nul + 2), loc, c);
-    if (!profile) return;
+    if (typeof profile === 'string') return malformed(profile);
     const why = await checkIcc(bytesSlice(profile));
-    if (why) run.malformed(loc, c.start, c.end, why);
-    else run.metadata(D.IccProfile, loc, c.start, c.end, { name: clip(keyword, 79), bytes: profile.length });
-    return;
+    if (why) return malformed(why);
+    return { findings: [run.metadata(D.IccProfile, loc, c.start, c.end, { name: clip(keyword, 79), bytes: profile.length })] };
   }
   let text: { compressed: boolean; from: number };
   if (c.type === 'tEXt') text = { compressed: false, from: nul + 1 };
   else if (c.type === 'zTXt') {
-    if (head[nul + 1] !== 0) {
-      run.malformed(loc, c.start, c.end, 'zTXt names a compression method PNG does not define');
-      return;
-    }
+    if (head[nul + 1] !== 0) return malformed('zTXt names a compression method PNG does not define');
     text = { compressed: true, from: nul + 2 };
   } else {
     // iTXt: a compression flag and method, then a language tag and a translated keyword, each ending in NUL.
@@ -519,46 +544,104 @@ async function metadataChunk(run: Run, c: Chunk, data: Uint8Array | undefined, l
     const method = head[nul + 2];
     const lang = head.indexOf(0, nul + 3);
     const translated = lang < 0 ? -1 : head.indexOf(0, lang + 1);
-    if (flag > 1 || method !== 0 || translated < 0) {
-      run.malformed(loc, c.start, c.end, 'iTXt breaks its layout');
-      return;
-    }
+    if (flag > 1 || method !== 0 || translated < 0) return malformed('iTXt breaks its layout');
     text = { compressed: flag === 1, from: translated + 1 };
   }
   const raw = RAW_PROFILE.exec(keyword)?.[1].toLowerCase();
   const xmp = keyword === 'XML:com.adobe.xmp';
   let inflated: Uint8Array | undefined;
   if (text.compressed) {
-    inflated = await inflateMetadata(run, body(text.from), loc, c);
-    if (!inflated) return;
+    const done = await inflateMetadata(run, body(text.from), loc, c);
+    if (typeof done === 'string') return malformed(done);
+    inflated = done;
   }
   if (xmp) {
     const chunks = inflated ? bytesSlice(inflated).chunks() : body(text.from).chunks();
-    run.metadata(D.Xmp, loc, c.start, c.end);
-    if (await hasDoctype(chunks)) run.report(C.Metadata, D.Doctype, loc);
-    return;
+    const found = [run.metadata(D.Xmp, loc, c.start, c.end)];
+    if (await hasDoctype(chunks)) found.push(run.report(C.Metadata, D.Doctype, loc));
+    return { findings: found };
   }
-  if (raw === 'exif' || raw === 'app1') run.metadata(D.Exif, loc, c.start, c.end, { keyword });
-  else if (raw === 'iptc' || raw === '8bim') run.metadata(D.Iptc, loc, c.start, c.end, { keyword });
-  else if (raw === 'xmp') run.metadata(D.Xmp, loc, c.start, c.end, { keyword });
-  else if (raw === 'icc' || raw === 'icm') run.metadata(D.IccProfile, loc, c.start, c.end, { keyword });
-  else run.metadata(D.Text, loc, c.start, c.end, { keyword: clip(keyword, 79) });
+  if (raw === 'exif' || raw === 'app1') return { findings: [run.metadata(D.Exif, loc, c.start, c.end, { keyword })] };
+  if (raw === 'iptc' || raw === '8bim') return { findings: [run.metadata(D.Iptc, loc, c.start, c.end, { keyword })] };
+  if (raw === 'xmp') return { findings: [run.metadata(D.Xmp, loc, c.start, c.end, { keyword })] };
+  if (raw === 'icc' || raw === 'icm') return { findings: [run.metadata(D.IccProfile, loc, c.start, c.end, { keyword })] };
+  return { findings: [run.metadata(D.Text, loc, c.start, c.end, { keyword: clip(keyword, 79) })] };
 }
 
-/** Inflates a compressed metadata value up to the metadata size limit. Returns undefined, after reporting, when it does not inflate. */
-async function inflateMetadata(run: Run, slice: ReturnType<typeof fileSlice>, loc: string, c: Chunk): Promise<Uint8Array | undefined> {
+/** Inflates a compressed metadata value up to the metadata size limit. Returns why it is malformed, as a string, when it does not inflate. */
+async function inflateMetadata(run: Run, slice: ReturnType<typeof fileSlice>, loc: string, c: Chunk): Promise<Uint8Array | string> {
   const pieces: Uint8Array[] = [];
   try {
     const done = await inflateChunks(slice.chunks(), run.limits.metadataBytes, piece => pieces.push(piece), run.deadline);
-    if (done.consumed < slice.size) {
-      run.malformed(loc, c.start, c.end, `${c.type} holds bytes after its compressed text`);
-      return undefined;
-    }
+    if (done.consumed < slice.size) return `${c.type} holds bytes after its compressed text`;
   } catch (e) {
     if (!(e instanceof InflateError)) throw e;
     if (e.kind === 'over') run.limit(D.MetadataSize, `${loc} inflates past ${run.limits.metadataBytes} bytes`, { limit: run.limits.metadataBytes });
-    run.malformed(loc, c.start, c.end, `${c.type} does not inflate: ${e.message}`);
-    return undefined;
+    return `${c.type} does not inflate: ${e.message}`;
   }
   return Buffer.concat(pieces);
+}
+
+/** A chunk of `type` holding the pieces, with its length and CRC. */
+function chunkPieces(type: string, data: Piece[]): Piece[] {
+  return [bytes(u32(lengthOf(data))), crcStart, bytes(ascii(type)), ...data, crcEnd];
+}
+
+/**
+ * The PNG as the rewrite writes it: the signature, then each chunk the plan keeps. IDAT and fdAT data is cut at the
+ * end of its zlib stream, an fdAT or fcTL takes the next sequence number when a chunk before it went, and the CRC of
+ * every chunk that changed is computed again.
+ */
+export async function pngPieces(run: Run, plan: PngPlan): Promise<Piece[]> {
+  const out: Piece[] = [bytes(Uint8Array.from(SIGNATURE))];
+  const r = run.reader;
+  let sequence = 0;
+  const passed = new Map<Stream, number>();
+  for (const e of plan.chunks) {
+    run.time();
+    const c = e.chunk;
+    switch (e.role) {
+      case 'keep':
+        out.push(copy(c.start, c.end - c.start));
+        break;
+      case 'optional': {
+        if (e.exif) {
+          const tiff = await exifPieces(run, e.exif.plan, e.findings, c.start, c.end);
+          if (tiff) out.push(...chunkPieces('eXIf', e.exif.skip ? [copy(c.data, e.exif.skip), ...tiff] : tiff));
+        } else if (!run.drops(e.findings, c.start, c.end)) out.push(copy(c.start, c.end - c.start));
+        break;
+      }
+      case 'frame': {
+        const data = Uint8Array.from(await r.read(c.data, c.length));
+        const v = new DataView(data.buffer);
+        if (v.getUint32(0) === sequence) out.push(copy(c.start, c.end - c.start));
+        else {
+          v.setUint32(0, sequence);
+          out.push(...chunkPieces(c.type, [bytes(data)]));
+        }
+        sequence++;
+        break;
+      }
+      default: {
+        const s = e.stream;
+        if (!s) break;
+        const before = passed.get(s) ?? 0;
+        const n = c.length - s.skip;
+        passed.set(s, before + n);
+        const consumed = s.consumed ?? before + n;
+        // A chunk that holds only bytes after the end of the stream goes.
+        if (before >= consumed) break;
+        const keep = Math.min(n, consumed - before);
+        if (s.skip === 0) {
+          out.push(...(keep === n ? [copy(c.start, c.end - c.start)] : chunkPieces(c.type, [copy(c.data, keep)])));
+          break;
+        }
+        const seq = new View(await r.read(c.data, 4)).u32(0);
+        if (keep === n && seq === sequence) out.push(copy(c.start, c.end - c.start));
+        else out.push(...chunkPieces(c.type, [bytes(u32(sequence)), copy(c.data + 4, keep)]));
+        sequence++;
+      }
+    }
+  }
+  return out;
 }

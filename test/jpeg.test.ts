@@ -1,6 +1,8 @@
 import { expect } from 'chai';
-import { inspectImage } from '../src';
-import { fixture, inspectFixture, kindSet, kinds, of, reason, summary } from './helpers/util';
+import { disarmImage, inspectImage } from '../src';
+import { IfdReader } from '../src/ifd';
+import { bytesSlice } from '../src/slice';
+import { fixture, inspectFixture, jpegSegments, kindSet, kinds, must, of, output, reason, summary } from './helpers/util';
 
 /** A JPEG segment: marker, length, payload. */
 const segment = (marker: number, payload: Buffer | string) => {
@@ -140,5 +142,42 @@ describe('JPEG', () => {
     expect([r.status, kinds(r), r.findings[0].data]).to.deep.equal(['clean', ['METADATA/THUMBNAIL'], { format: 'raw' }]);
     const short = Buffer.concat([j.subarray(0, app0At), segment(0xe0, jfif.subarray(0, 16)), j.subarray(app0At + 2 + j.readUInt16BE(app0At + 2))]);
     expect(kinds(await inspectImage(short))).to.deep.equal(['METADATA/MALFORMED']);
+  });
+});
+
+describe('EXIF thumbnail pointers', () => {
+  it('drops a thumbnail pointer of 0 bytes from EXIF and keeps the rest', async () => {
+    // IFD0 holds a camera name and points at IFD1, whose thumbnail offset points at the end and whose length is 0.
+    const tiff = Buffer.alloc(56);
+    tiff.write('II*\0', 0, 'latin1');
+    tiff.writeUInt32LE(8, 4);
+    tiff.writeUInt16LE(1, 8);
+    tiff.writeUInt16LE(0x010f, 10);
+    tiff.writeUInt16LE(2, 12);
+    tiff.writeUInt32LE(4, 14);
+    tiff.write('Cam\0', 18, 'latin1');
+    tiff.writeUInt32LE(26, 22);
+    tiff.writeUInt16LE(2, 26);
+    for (const [i, tag, value] of [
+      [0, 513, 56],
+      [1, 514, 0],
+    ]) {
+      const at = 28 + i * 12;
+      tiff.writeUInt16LE(tag, at);
+      tiff.writeUInt16LE(4, at + 2);
+      tiff.writeUInt32LE(1, at + 4);
+      tiff.writeUInt32LE(value, at + 8);
+    }
+    const j = fixture('clean', 'jpeg', 'gray.jpg');
+    const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, 0, 0]), Buffer.from('Exif\0\0', 'latin1'), tiff]);
+    app1.writeUInt16BE(app1.length - 2, 2);
+    const d = await disarmImage(Buffer.concat([j.subarray(0, 2), app1, j.subarray(2)]));
+    expect([d.status, kinds(d.before)]).to.deep.equal(['defused', ['METADATA/EXIF', 'STRUCTURE/EXTRA_BLOCK']]);
+    const exif = must(
+      jpegSegments(output(d)).find(([m]) => m === 0xe1),
+      'APP1',
+    )[1].subarray(6);
+    const r = await IfdReader.open(bytesSlice(exif));
+    expect((await r.ifd(r.first)).next).to.equal(0);
   });
 });
