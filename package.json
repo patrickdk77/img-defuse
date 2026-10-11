@@ -1,6 +1,6 @@
 {
   "name": "@patrickdk77/img-defuse",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Inspect PNG, JPEG, GIF, WebP, TIFF, BMP and ICO images for structure that readers disagree on, decompression and dimension bombs, trailing and hidden data, polyglots and metadata, and score the risk. Strict parsers, bounded memory, no runtime dependencies.",
   "license": "MIT",
   "author": "patrickdk77",
@@ -22,7 +22,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('build-test',{recursive:true,force:true})\"",
@@ -78,7 +78,7 @@
     "@biomejs/biome": "^2.5.15",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^22.20.5",
+    "@types/node": "^18.19.130",
     "chai": "^6.3.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",

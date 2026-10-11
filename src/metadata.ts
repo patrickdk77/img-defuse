@@ -34,8 +34,7 @@ const MARKERS = ['<!doctype', '<!entity'];
 export async function hasDoctype(chunks: AsyncIterable<Uint8Array>): Promise<boolean> {
   let carry = '';
   for await (const c of chunks) {
-    let s = '';
-    for (const b of c) if (b !== 0) s += String.fromCharCode(b);
+    const s = Buffer.from(c.buffer, c.byteOffset, c.byteLength).toString('latin1').replaceAll('\0', '');
     const text = (carry + s).toLowerCase();
     if (MARKERS.some(m => text.includes(m))) return true;
     carry = text.slice(-16);

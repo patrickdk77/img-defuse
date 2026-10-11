@@ -10,7 +10,7 @@ It has no runtime dependencies and keeps memory bounded. It checks every image's
 npm install @patrickdk77/img-defuse
 ```
 
-Node 22 or later.
+Node 18 or later.
 
 ## Quick start
 
@@ -207,7 +207,7 @@ A finding's `category` and `detail` are plain strings, and `weight`, when set, s
 
 ## Development
 
-Development needs Node 22.12 or later. mocha 12 requires it, and the CommonJS test build loads chai 6, an ES module, with `require()`, which Node 22 supports only from 22.12. The pre-commit hook needs Node 22.22.1 or later for lint-staged. The published package has no runtime dependencies and runs on any Node 22.
+Development needs Node 22.12 or later. mocha 12 requires it, and the CommonJS test build loads chai 6, an ES module, with `require()`, which Node 22 supports only from 22.12. The pre-commit hook needs Node 22.22.1 or later for lint-staged. The published package has no runtime dependencies and runs on Node 18 or later.
 
 ```sh
 npm install --ignore-scripts
