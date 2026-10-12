@@ -1,4 +1,6 @@
+import { bufferSource } from './io';
 import { latin1 } from './slice';
+import type { ByteSource, DetectOptions, FormatDetection } from './types';
 
 export type Kind = 'png' | 'jpeg' | 'gif' | 'webp' | 'tiff' | 'bmp' | 'ico' | 'cur' | 'jp2' | 'j2k' | 'jxl' | 'psd' | 'psb' | 'emf' | 'wmf';
 
@@ -72,4 +74,19 @@ export function sniffType(head: Uint8Array): string | undefined {
   if (/^\s*<svg[\s>]/i.test(s)) return 'image/svg+xml';
   if (/^\s*<(!doctype html|html|script)[\s>]/i.test(s)) return 'text/html';
   return undefined;
+}
+
+/**
+ * Whether img-defuse reads `source`, and as which format. It is the test the inspection picks its reader by: the
+ * signature in the first 64 bytes. The name and declared type play no part. The source stays open.
+ */
+export async function detectImageSource(source: ByteSource, _options: DetectOptions = {}): Promise<FormatDetection | undefined> {
+  const size = await source.size();
+  const found = detect(await source.read(0, Math.min(size, 64)));
+  return found && { mimeType: found.mimeType, extension: found.format, offset: 0 };
+}
+
+/** `detectImageSource` over bytes in memory. */
+export function detectImage(bytes: Uint8Array, options: DetectOptions = {}): Promise<FormatDetection | undefined> {
+  return detectImageSource(bufferSource(bytes), options);
 }

@@ -1,5 +1,7 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { expect } from 'chai';
-import { inspectImage } from '../src';
+import { type ByteSource, bufferSource, detectImage, detectImageSource, imagePlugin, inspectImage } from '../src';
 import { detect, sniffType } from '../src/detect';
 import { fixture, inspectFixture, kinds } from './helpers/util';
 
@@ -54,5 +56,50 @@ describe('format detection', () => {
     expect(sniffType(Buffer.from('  <html><body>'))).to.equal('text/html');
     expect(sniffType(Buffer.from('<svg xmlns="x">'))).to.equal('image/svg+xml');
     expect(sniffType(Buffer.from('hello'))).to.equal(undefined);
+  });
+});
+
+const FIXTURES = path.join(__dirname, '..', '..', 'test', 'fixtures');
+const firstPng = () => {
+  const dir = path.join(FIXTURES, 'clean', 'png');
+  return fs.readFileSync(path.join(dir, fs.readdirSync(dir).sort()[0]));
+};
+const walk = (dir: string): string[] =>
+  fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => (e.isDirectory() ? walk(path.join(dir, e.name)) : /\.(json|md)$/.test(e.name) ? [] : [path.join(dir, e.name)]));
+
+describe('detectImage', () => {
+  it('names the format the inspection reads, for every fixture, and nothing where the inspection recognizes none', async function () {
+    this.timeout(120_000);
+    const files = walk(FIXTURES);
+    expect(files.length).to.be.greaterThan(50);
+    for (const file of files) {
+      const bytes = fs.readFileSync(file);
+      const r = await inspectImage(bytes);
+      const d = await detectImage(bytes);
+      const key = path.relative(FIXTURES, file);
+      if (r.format === '') expect(d, key).to.equal(undefined);
+      else expect(d, key).to.deep.equal({ mimeType: r.mimeType, extension: r.format, offset: 0 });
+    }
+  });
+
+  it('goes by content alone, and leaves formats it does not read to others', async () => {
+    const png = firstPng();
+    expect(await detectImage(png, { name: 'photo.jpg', declaredType: 'image/jpeg' })).to.deep.equal({ mimeType: 'image/png', extension: 'png', offset: 0 });
+    for (const name of ['avif.avif', 'heic.heic', 'svg.svg', 'unknown.bin']) {
+      expect(await detectImage(fs.readFileSync(path.join(FIXTURES, 'detect', name)), { name }), name).to.equal(undefined);
+    }
+    expect(await detectImage(Buffer.from('%PDF-1.7\n'), { name: 'x.png' })).to.equal(undefined);
+  });
+
+  it('leaves the source open, and lets imagePlugin take what it finds', async () => {
+    let closed = 0;
+    const png = firstPng();
+    const inner = bufferSource(png);
+    const source: ByteSource = { size: () => inner.size(), read: (o, n) => inner.read(o, n), close: async () => void closed++ };
+    expect((await detectImageSource(source))?.extension).to.equal('png');
+    expect(closed).to.equal(0);
+    const file = (bytes: Buffer, name?: string) => ({ name, size: bytes.length, location: 'x', depth: 1, source: bufferSource(bytes) });
+    expect(await imagePlugin().accepts(file(png, 'a.txt'))).to.equal(true);
+    expect(await imagePlugin().accepts(file(Buffer.from('plain text'), 'a.png'))).to.equal(false);
   });
 });

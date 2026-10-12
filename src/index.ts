@@ -1,3 +1,4 @@
+export { detectImage, detectImageSource } from './detect';
 export { disarmImage, disarmImageSource, inspectImage, inspectImageSource } from './engine';
 export { allFindingSpecs } from './findings';
 export { bufferSink, bufferSource, fileSink, fileSource, writableSink } from './io';

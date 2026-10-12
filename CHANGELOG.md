@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 - 2026-10-11
+
+- `detectImage` and `detectImageSource` tell a router whether img-defuse reads a file and in which format, by the signature test the inspection picks its reader by. `imagePlugin` takes what they find.
+
 ## 0.2.0 - 2026-10-11
 
 ### Formats

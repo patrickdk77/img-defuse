@@ -1,5 +1,5 @@
 import { RUN_OPTIONS, type RunContext } from './context';
-import { detect } from './detect';
+import { detectImageSource } from './detect';
 import { disarmAtDepth } from './engine';
 import { weightOf } from './score';
 import type { ContainedFilePlugin, ImageOptions } from './types';
@@ -16,7 +16,7 @@ export function imagePlugin(options?: ImageOptions): ContainedFilePlugin {
     kind: 'file',
     name: 'image',
     async accepts(file) {
-      return detect(await file.source.read(0, 64)) !== undefined;
+      return (await detectImageSource(file.source, { name: file.name, declaredType: file.declaredType })) !== undefined;
     },
     async process(file, sink, context) {
       const run = options ?? (context as RunContext)[RUN_OPTIONS] ?? {};
