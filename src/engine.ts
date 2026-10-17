@@ -82,9 +82,6 @@ interface Shape {
   images: number;
 }
 
-const PLUGIN_KEPT = new Set<string>([D.PluginPassed, D.PluginScrubbed]);
-const isPluginKept = (f: DefuseFinding) => f.category === C.EmbeddedImage && PLUGIN_KEPT.has(f.detail);
-
 /**
  * `incomplete` marks a run that stopped before it read the whole file. It is rejected without a score, whatever the
  * actions say, because an override can make the finding that stopped it look harmless. `isOutput` marks the check of a
@@ -99,8 +96,9 @@ function finish(findings: DefuseFinding[], options: ImageOptions, incomplete: bo
   const strippable = findings.some(
     f => f.action === 'strip' || (!isOutput && ((f.category === C.Metadata && f.detail === D.Stripped) || (f.category === C.EmbeddedImage && f.detail === D.PluginScrubbed))),
   );
-  // The upload's score leaves out what plugins kept; the output's score counts it.
-  const { score, risk } = scoreFindings(isOutput ? findings : findings.filter(f => !isPluginKept(f)), options);
+  // What a plugin decided counts at the weights of the plugin's own findings; the PLUGIN_* findings that record its
+  // answer weigh nothing.
+  const { score, risk } = scoreFindings(findings, options);
   return { status: rejected ? 'rejected' : strippable ? 'strippable' : 'clean', score, risk, findings, ...named };
 }
 

@@ -56,9 +56,9 @@ def(C.Metadata, D.Doctype, 'strip', 40, 'XML metadata, such as XMP, declares a d
 // EMBEDDED_IMAGE
 def(C.EmbeddedImage, D.NoPlugin, 'strip', 10, 'An image inside the image <({sniffed})|(unknown type)> is removed<. {reason}|. No plugin accepts it>');
 def(C.EmbeddedImage, D.TypeMismatch, 'info', 40, 'An image inside the image is declared <{declared}|as an image> but <its content looks like {sniffed}|its content is not recognized>');
-def(C.EmbeddedImage, D.PluginPassed, 'info', 6, 'An image inside the image is kept by plugin <plugin> with nothing removed');
-def(C.EmbeddedImage, D.PluginScrubbed, 'info', 3, 'An image inside the image is cleaned and kept by plugin <plugin>');
-def(C.EmbeddedImage, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the image inside the image is removed<: {reason}|>');
+def(C.EmbeddedImage, D.PluginPassed, 'info', 0, 'An image inside the image is kept by plugin <plugin> with nothing removed');
+def(C.EmbeddedImage, D.PluginScrubbed, 'info', 0, 'An image inside the image is cleaned and kept by plugin <plugin>');
+def(C.EmbeddedImage, D.PluginFailed, 'strip', 10, 'Plugin <plugin> failed, so the image inside the image is removed<: {reason}|>');
 def(C.EmbeddedImage, D.PluginRemoved, 'strip', 0, 'The image inside the image is removed by plugin <plugin>');
 // EXTERNAL
 def(C.External, D.LinkedProfile, 'strip', 40, 'The image loads its color profile from <{target}|a file outside it>');

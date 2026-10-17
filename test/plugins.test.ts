@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { bufferSink, bufferSource, ImageCategory as C, type ContainedFile, type ContainedFilePlugin, ImageDetail as D, disarmImage, imagePlugin, inspectImage } from '../src';
 import { RUN_OPTIONS, type RunContext } from '../src/context';
+import { weightOf } from '../src/score';
 import { fixture, grayPng, kinds, must, of, output } from './helpers/util';
 
 const fileOf = (bytes: Uint8Array, more: Partial<ContainedFile> = {}): ContainedFile => ({
@@ -88,12 +89,12 @@ describe('image plugin', () => {
     expect([typeof fromRun === 'object' && fromRun.result, typeof own === 'object' && own.result]).to.deep.equal(['scrubbed', 'passed']);
   });
 
-  it('keeps thumbnails and secondary images in a run, scoring them in the output and not in the upload', async () => {
+  it('keeps thumbnails and secondary images in a run, scored by what the plugin found in them, in the upload and the output', async () => {
     const d = await disarmImage(withThumb, { filePlugins: [imagePlugin()] });
     expect([d.status, d.before.score, d.after?.score, kinds(must(d.after, 'after'))]).to.deep.equal([
       'clean',
       0,
-      6,
+      0,
       ['METADATA/EXIF', 'METADATA/GPS', 'METADATA/THUMBNAIL', 'EMBEDDED_IMAGE/PLUGIN_PASSED'],
     ]);
     expect(Buffer.compare(output(d), withThumb)).to.equal(0);
@@ -152,6 +153,8 @@ describe('image plugin', () => {
     for (const [what, answer, detail] of answers) {
       const d = await disarmImage(withThumb, { filePlugins: [recording(answer)] });
       expect([what, d.status, of(d.before, `EMBEDDED_IMAGE/${detail}`).map(f => f.action)]).to.deep.equal([what, 'defused', ['strip']]);
+      // A plugin that failed did not answer, so the image weighs what one no plugin accepts does.
+      expect([what, weightOf(of(d.before, `EMBEDDED_IMAGE/${detail}`)[0], {})]).to.deep.equal([what, detail === 'PLUGIN_FAILED' ? 10 : 0]);
       expect(kinds(must(d.after, 'after'))).to.not.include('METADATA/THUMBNAIL');
     }
   });

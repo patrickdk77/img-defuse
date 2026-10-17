@@ -223,13 +223,13 @@ The bytes a plugin writes replace the image, and img-defuse writes the block tha
 
 | Detail | Action | Weight | What it means |
 |---|---|---|---|
-| EMBEDDED_IMAGE/PLUGIN_PASSED | info | 6 | A plugin kept the image with nothing removed |
-| EMBEDDED_IMAGE/PLUGIN_SCRUBBED | info | 3 | A plugin cleaned the image and kept it |
+| EMBEDDED_IMAGE/PLUGIN_PASSED | info | 0 | A plugin kept the image with nothing removed |
+| EMBEDDED_IMAGE/PLUGIN_SCRUBBED | info | 0 | A plugin cleaned the image and kept it |
 | EMBEDDED_IMAGE/PLUGIN_REMOVED | strip | 0 | A plugin removed the image |
-| EMBEDDED_IMAGE/PLUGIN_FAILED | strip | 0 | A plugin threw, scrubbed and wrote nothing, or wrote a copy the block holding the image cannot take |
+| EMBEDDED_IMAGE/PLUGIN_FAILED | strip | 10 | A plugin threw, scrubbed and wrote nothing, or wrote a copy the block holding the image cannot take. It weighs what NO_PLUGIN does |
 | EMBEDDED_IMAGE/NO_PLUGIN | strip | 10 | No plugin accepts the image |
 
-The upload's score leaves out PLUGIN_PASSED and PLUGIN_SCRUBBED, and the copy's score counts them, as in pdf-defuse. The check of the copy matches an image a plugin kept by its SHA-256 and does not show it to the plugins again.
+A plugin's answer is final, and the findings it returns are all the image adds to the score, in the upload's score and the copy's, as in pdf-defuse. The check of the copy matches an image a plugin kept by its SHA-256 and does not show it to the plugins again.
 
 When the bytes are not the type the container declares, EMBEDDED_IMAGE/TYPE_MISMATCH reports it, `info`. An override that makes it `strip` removes the image before any plugin sees it. Thumbnails of raw pixels, such as a JFIF thumbnail, are not files and never go to a plugin.
 

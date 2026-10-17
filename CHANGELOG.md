@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.0 - 2026-10-17
+
+- EMBEDDED_IMAGE/PLUGIN_PASSED and PLUGIN_SCRUBBED weigh 0, in the upload's score and the copy's. The copy's score counted them at 6 and 3. An image a plugin kept now scores what the plugin found in it.
+- EMBEDDED_IMAGE/PLUGIN_FAILED weighs 10, what EMBEDDED_IMAGE/NO_PLUGIN weighs, since no plugin answered for the image. It weighed 0.
+
 ## 0.2.1 - 2026-10-11
 
 - `detectImage` and `detectImageSource` tell a router whether img-defuse reads a file and in which format, by the signature test the inspection picks its reader by. `imagePlugin` takes what they find.
