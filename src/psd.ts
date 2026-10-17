@@ -477,10 +477,10 @@ async function layerInfo(w: Walk, start: number, end: number, where: string, dep
 }
 
 /**
- * Reads tagged blocks in [start, end): a signature, a key, a length and the data. `global` marks the blocks at the end
+ * Reads tagged blocks in [start, end): a signature, a key, a length and the data. `atEnd` marks the blocks at the end
  * of the layer and mask section, which psd-tools reads padded to four bytes.
  */
-async function taggedBlocks(w: Walk, start: number, end: number, where: string, global: boolean, depth: number): Promise<void> {
+async function taggedBlocks(w: Walk, start: number, end: number, where: string, atEnd: boolean, depth: number): Promise<void> {
   const run: Run = w.run;
   const r = run.reader;
   let q = start;
@@ -510,7 +510,7 @@ async function taggedBlocks(w: Walk, start: number, end: number, where: string, 
     run.block();
     // Padding to four bytes after a global block, when what follows it is another block.
     let blockEnd = dataEnd;
-    if (global && length % 4 !== 0) {
+    if (atEnd && length % 4 !== 0) {
       const pad = 4 - (length % 4);
       if (dataEnd + pad + 4 <= end) {
         const after = await r.read(dataEnd, pad + 4);

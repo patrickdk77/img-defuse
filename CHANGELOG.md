@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2026-10-17
+
+- The callback that reads a lossless WebP 64 KB at a time is `readAt`, not `fetch`, and the PSD reader's flag for blocks at the end of the layer and mask section is `atEnd`, not `global`. Security scanners took `fetch` for network access. img-defuse never used the network, and nothing else changes.
+
 ## 0.3.0 - 2026-10-17
 
 - EMBEDDED_IMAGE/PLUGIN_PASSED and PLUGIN_SCRUBBED weigh 0, in the upload's score and the copy's. The copy's score counted them at 6 and 3. An image a plugin kept now scores what the plugin found in it.

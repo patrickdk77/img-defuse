@@ -54,7 +54,7 @@ class Bits {
   at = 0;
 
   constructor(
-    private readonly fetch: (offset: number, length: number) => Promise<Uint8Array>,
+    private readonly readAt: (offset: number, length: number) => Promise<Uint8Array>,
     readonly length: number,
   ) {}
 
@@ -74,7 +74,7 @@ class Bits {
     const windowEnd = this.windowAt + this.window.length;
     if (byte + 32 <= windowEnd || windowEnd >= this.length || byte >= this.length) return;
     this.windowAt = byte;
-    this.window = await this.fetch(byte, 65536);
+    this.window = await this.readAt(byte, 65536);
   }
 
   private byte(i: number): number {

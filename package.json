@@ -1,6 +1,6 @@
 {
   "name": "@patrickdk77/img-defuse",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Inspect and defuse PNG, JPEG, GIF, WebP, TIFF, BMP and ICO images. Finds structure that readers disagree on, decompression and dimension bombs, trailing and hidden data, polyglots and metadata, scores the risk, and writes a copy without them by rewriting chunks, segments and IFDs. Strict parsers, bounded memory, no runtime dependencies.",
   "license": "MIT",
   "author": "patrickdk77",
